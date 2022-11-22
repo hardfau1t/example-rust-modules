@@ -1,0 +1,8 @@
+*.cmd
+*.ko
+*.mod
+*.mod.c
+*.o
+*.symvers
+*.order
+rust-project.json
