@@ -1,0 +1,1428 @@
+From c886e6aa7c8f805798388d85018890bfccc46943 Mon Sep 17 00:00:00 2001
+From: gireeshm <gireeshm@vayavyalabs.com>
+Date: Fri, 16 Dec 2022 10:13:07 +0530
+Subject: [PATCH 5/5] fixed errors from netdev implementation from #439
+
+---
+ drivers/net/dummy_rs.rs         |  31 ++-
+ rust/kernel/error.rs            |   8 +-
+ rust/kernel/lib.rs              |  31 ++-
+ rust/kernel/net.rs              | 392 -------------------------------
+ rust/kernel/net/device/flags.rs | 130 +++++------
+ rust/kernel/net/device/mod.rs   |  47 ++--
+ rust/kernel/net/ethtool.rs      |  13 +-
+ rust/kernel/net/mod.rs          | 395 +++++++++++++++++++++++++++++++-
+ rust/kernel/net/rtnl.rs         |   1 +
+ rust/macros/helpers.rs          |   6 +-
+ rust/macros/net.rs              |   6 +-
+ 11 files changed, 533 insertions(+), 527 deletions(-)
+ delete mode 100644 rust/kernel/net.rs
+
+diff --git a/drivers/net/dummy_rs.rs b/drivers/net/dummy_rs.rs
+index 9e23bfddfea3..bb09641f089e 100644
+--- a/drivers/net/dummy_rs.rs
++++ b/drivers/net/dummy_rs.rs
+@@ -29,13 +29,10 @@
+ //! rust rewrite of the C version from Nick Holloway, 27th May 1994
+ //! see [dummy.c](./dummy.c)
+ 
+-#![no_std]
+-#![feature(allocator_api, global_asm)]
+-
+ use kernel::net::device;
+ use kernel::net::prelude::*;
+ use kernel::net::rtnl;
+-use kernel::Error;
++use kernel::error::{self, Error};
+ use kernel::SavedAsPointer;
+ use kernel::{
+     net::netlink::{NlAttrVec, NlExtAck},
+@@ -44,16 +41,16 @@ use kernel::{
+ 
+ module! {
+     type: RustNetDummy,
+-    name: b"dummy_rs",
+-    author: b"Finn Behrens <me@kloenk.dev>",
+-    description: b"Rust dummy network driver",
+-    license: b"GPL v2",
+-    alias_rtnl_link: b"dummy_rs",
++    name: "dummy_rs",
++    author: "Finn Behrens <me@kloenk.dev>",
++    description: "Rust dummy network driver",
++    license: "GPL v2",
++    alias_rtnl_link: "dummy_rs",
+     params: {
+         numdummies: usize {
+             default: 0,
+             permissions: 0,
+-            description: b"Number of dummy_rs pseudo devices",
++            description: "Number of dummy_rs pseudo devices",
+         },
+     },
+ }
+@@ -67,8 +64,8 @@ fn setup(dev: &mut NetDevice<DummyRsDev>) {
+     dev.add_flag(device::Flag::NOARP);
+     dev.remove_flag(device::Flag::MULTICAST);
+ 
+-    dev.add_private_flag(device::PrivFlag::LIVE_ADDR_CHANGE);
+-    dev.add_private_flag(device::PrivFlag::NO_QUEUE);
++    dev.add_private_flag(device::priv_flag::LIVE_ADDR_CHANGE);
++    dev.add_private_flag(device::priv_flag::NO_QUEUE);
+ 
+     let mut feature = device::Features::empty();
+ 
+@@ -91,10 +88,10 @@ fn setup(dev: &mut NetDevice<DummyRsDev>) {
+ fn validate(tb: &NlAttrVec, _data: &NlAttrVec, _ext_ack: &NlExtAck) -> Result {
+     if let Some(addr) = tb.get(kernel::bindings::IFLA_ADDRESS) {
+         if Some(kernel::net::netlink::ETH_ALEN) != addr.nla_len() {
+-            return Err(Error::EINVAL);
++            return Err(error::code::EINVAL);
+         }
+         if !addr.is_valid_ether_addr() {
+-            return Err(Error::EADDRNOTAVAIL);
++            return Err(error::code::EADDRNOTAVAIL);
+         }
+     }
+     Ok(())
+@@ -109,8 +106,8 @@ rtnl_link_ops! {
+ 
+ struct RustNetDummy {}
+ 
+-impl KernelModule for RustNetDummy {
+-    fn init() -> Result<Self> {
++impl kernel::Module for RustNetDummy {
++    fn init(name: &'static CStr, module: &'static ThisModule) -> Result<Self> {
+         let num = *numdummies.read();
+ 
+         unsafe { dummy_rs_LINK_OPS.register() }?;
+@@ -189,7 +186,7 @@ impl NetDeviceOps<Self> for DummyRsDev {
+         device::helpers::eth_validate_addr(dev)
+     }
+ 
+-    fn set_mac_addr(dev: &mut NetDevice<Self>, p: *mut kernel::c_types::c_void) -> Result {
++    fn set_mac_addr(dev: &mut NetDevice<Self>, p: *mut core::ffi::c_void) -> Result {
+         unsafe { device::helpers::eth_mac_addr(dev, p) }
+     }
+ 
+diff --git a/rust/kernel/error.rs b/rust/kernel/error.rs
+index 18c74055b9c9..9c82fdda2e1d 100644
+--- a/rust/kernel/error.rs
++++ b/rust/kernel/error.rs
+@@ -569,7 +569,8 @@ impl From<AllocError> for Error {
+ // # Invariant: `-bindings::MAX_ERRNO` fits in an `i16`.
+ crate::static_assert!(bindings::MAX_ERRNO <= -(i16::MIN as i32) as u32);
+ 
+-pub(crate) fn from_kernel_result_helper<T>(r: Result<T>) -> T
++// pub(crate) fn from_kernel_result_helper<T>(r: Result<T>) -> T
++pub fn from_kernel_result_helper<T>(r: Result<T>) -> T
+ where
+     T: From<i16>,
+ {
+@@ -605,15 +606,16 @@ where
+ ///     }
+ /// }
+ /// ```
++#[macro_export]
+ macro_rules! from_kernel_result {
+     ($($tt:tt)*) => {{
+-        $crate::from_kernel_result_helper((|| {
++        $crate::error::from_kernel_result_helper((|| {
+             $($tt)*
+         })())
+     }};
+ }
+ 
+-pub(crate) use from_kernel_result;
++pub use from_kernel_result;
+ 
+ /// Transform a kernel "error pointer" to a normal pointer.
+ ///
+diff --git a/rust/kernel/lib.rs b/rust/kernel/lib.rs
+index 8e3593c0245f..c6ad6bf77b14 100644
+--- a/rust/kernel/lib.rs
++++ b/rust/kernel/lib.rs
+@@ -13,30 +13,26 @@
+ 
+ #![no_std]
+ /* DEBUG_CONFLICT
+-#![feature(coerce_unsized)]
+-#![feature(const_ptr_offset_from)]
+-#![feature(const_refs_to_cell)]
+-#![feature(const_trait_impl)]
+-#![feature(core_ffi_c)]
+-#![feature(c_size_t)]
+-#![feature(dispatch_from_dyn)]
+-#![feature(duration_constants)]
+ #![feature(generic_associated_types)]
+-#![feature(ptr_metadata)]
+-#![feature(unsize)]
+ */
+ #![feature(
+     allocator_api,
+     alloc_error_handler,
+     associated_type_defaults,
+-    const_fn_trait_bound,
++    c_size_t,
++    coerce_unsized,
+     const_mut_refs,
+-    const_panic,
+-    const_raw_ptr_deref,
+-    const_unreachable_unchecked,
++    const_ptr_offset_from,
++    const_refs_to_cell,
++    const_trait_impl,
++    core_ffi_c,
++    dispatch_from_dyn,
++    doc_cfg,
++    duration_constants,
++    generic_associated_types,
++    ptr_metadata,
+     receiver_trait,
+-    try_reserve,
+-    doc_cfg
++    unsize
+ )]
+ 
+ // Ensure conditional compilation based on the kernel configuration works;
+@@ -119,7 +115,8 @@ pub mod kunit;
+ #[doc(hidden)]
+ pub use build_error::build_error;
+ 
+-pub use crate::error::{to_result, Error, Result, from_kernel_result_helper};
++// TODO: later remove from_kernel_result, added temporarily to compile
++pub use crate::error::{to_result, Error, Result};
+ pub use crate::types::{
+     bit, bits_iter, ARef, AlwaysRefCounted, Bit, Bool, Either, Either::Left, Either::Right, False,
+     Mode, SavedAsPointer, SavedAsPointerMut, Opaque, PointerWrapper, ScopeGuard, True,
+diff --git a/rust/kernel/net.rs b/rust/kernel/net.rs
+deleted file mode 100644
+index 0115f3a35cd0..000000000000
+--- a/rust/kernel/net.rs
++++ /dev/null
+@@ -1,392 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-
+-//! Networking core.
+-//!
+-//! C headers: [`include/net/net_namespace.h`](../../../../include/linux/net/net_namespace.h),
+-//! [`include/linux/netdevice.h`](../../../../include/linux/netdevice.h),
+-//! [`include/linux/skbuff.h`](../../../../include/linux/skbuff.h).
+-
+-use crate::{bindings, str::CStr, to_result, ARef, AlwaysRefCounted, Error, Result};
+-use core::{cell::UnsafeCell, ptr::NonNull};
+-
+-#[cfg(CONFIG_NETFILTER)]
+-pub mod filter;
+-
+-/// Wraps the kernel's `struct net_device`.
+-#[repr(transparent)]
+-pub struct Device(UnsafeCell<bindings::net_device>);
+-
+-// SAFETY: Instances of `Device` are created on the C side. They are always refcounted.
+-unsafe impl AlwaysRefCounted for Device {
+-    fn inc_ref(&self) {
+-        // SAFETY: The existence of a shared reference means that the refcount is nonzero.
+-        unsafe { bindings::dev_hold(self.0.get()) };
+-    }
+-
+-    unsafe fn dec_ref(obj: core::ptr::NonNull<Self>) {
+-        // SAFETY: The safety requirements guarantee that the refcount is nonzero.
+-        unsafe { bindings::dev_put(obj.cast().as_ptr()) };
+-    }
+-}
+-
+-/// Wraps the kernel's `struct net`.
+-#[repr(transparent)]
+-pub struct Namespace(UnsafeCell<bindings::net>);
+-
+-impl Namespace {
+-    /// Finds a network device with the given name in the namespace.
+-    pub fn dev_get_by_name(&self, name: &CStr) -> Option<ARef<Device>> {
+-        // SAFETY: The existence of a shared reference guarantees the refcount is nonzero.
+-        let ptr =
+-            NonNull::new(unsafe { bindings::dev_get_by_name(self.0.get(), name.as_char_ptr()) })?;
+-        Some(unsafe { ARef::from_raw(ptr.cast()) })
+-    }
+-}
+-
+-// SAFETY: Instances of `Namespace` are created on the C side. They are always refcounted.
+-unsafe impl AlwaysRefCounted for Namespace {
+-    fn inc_ref(&self) {
+-        // SAFETY: The existence of a shared reference means that the refcount is nonzero.
+-        unsafe { bindings::get_net(self.0.get()) };
+-    }
+-
+-    unsafe fn dec_ref(obj: core::ptr::NonNull<Self>) {
+-        // SAFETY: The safety requirements guarantee that the refcount is nonzero.
+-        unsafe { bindings::put_net(obj.cast().as_ptr()) };
+-    }
+-}
+-
+-/// Returns the network namespace for the `init` process.
+-pub fn init_ns() -> &'static Namespace {
+-    unsafe { &*core::ptr::addr_of!(bindings::init_net).cast() }
+-}
+-
+-/// Wraps the kernel's `struct sk_buff`.
+-#[repr(transparent)]
+-pub struct SkBuff(UnsafeCell<bindings::sk_buff>);
+-
+-impl SkBuff {
+-    /// Creates a reference to an [`SkBuff`] from a valid pointer.
+-    ///
+-    /// # Safety
+-    ///
+-    /// The caller must ensure that `ptr` is valid and remains valid for the lifetime of the
+-    /// returned [`SkBuff`] instance.
+-    pub unsafe fn from_ptr<'a>(ptr: *const bindings::sk_buff) -> &'a SkBuff {
+-        // SAFETY: The safety requirements guarantee the validity of the dereference, while the
+-        // `SkBuff` type being transparent makes the cast ok.
+-        unsafe { &*ptr.cast() }
+-    }
+-
+-    /// Returns the remaining data in the buffer's first segment.
+-    pub fn head_data(&self) -> &[u8] {
+-        // SAFETY: The existence of a shared reference means that the refcount is nonzero.
+-        let headlen = unsafe { bindings::skb_headlen(self.0.get()) };
+-        let len = headlen.try_into().unwrap_or(usize::MAX);
+-        // SAFETY: The existence of a shared reference means `self.0` is valid.
+-        let data = unsafe { core::ptr::addr_of!((*self.0.get()).data).read() };
+-        // SAFETY: The `struct sk_buff` conventions guarantee that at least `skb_headlen(skb)` bytes
+-        // are valid from `skb->data`.
+-        unsafe { core::slice::from_raw_parts(data, len) }
+-    }
+-
+-    /// Returns the total length of the data (in all segments) in the skb.
+-    #[allow(clippy::len_without_is_empty)]
+-    pub fn len(&self) -> u32 {
+-        // SAFETY: The existence of a shared reference means `self.0` is valid.
+-        unsafe { core::ptr::addr_of!((*self.0.get()).len).read() }
+-    }
+-}
+-
+-// SAFETY: Instances of `SkBuff` are created on the C side. They are always refcounted.
+-unsafe impl AlwaysRefCounted for SkBuff {
+-    fn inc_ref(&self) {
+-        // SAFETY: The existence of a shared reference means that the refcount is nonzero.
+-        unsafe { bindings::skb_get(self.0.get()) };
+-    }
+-
+-    unsafe fn dec_ref(obj: core::ptr::NonNull<Self>) {
+-        // SAFETY: The safety requirements guarantee that the refcount is nonzero.
+-        unsafe {
+-            bindings::kfree_skb_reason(
+-                obj.cast().as_ptr(),
+-                bindings::skb_drop_reason_SKB_DROP_REASON_NOT_SPECIFIED,
+-            )
+-        };
+-    }
+-}
+-
+-/// An IPv4 address.
+-///
+-/// This is equivalent to C's `in_addr`.
+-#[repr(transparent)]
+-pub struct Ipv4Addr(bindings::in_addr);
+-
+-impl Ipv4Addr {
+-    /// A wildcard IPv4 address.
+-    ///
+-    /// Binding to this address means binding to all IPv4 addresses.
+-    pub const ANY: Self = Self::new(0, 0, 0, 0);
+-
+-    /// The IPv4 loopback address.
+-    pub const LOOPBACK: Self = Self::new(127, 0, 0, 1);
+-
+-    /// The IPv4 broadcast address.
+-    pub const BROADCAST: Self = Self::new(255, 255, 255, 255);
+-
+-    /// Creates a new IPv4 address with the given components.
+-    pub const fn new(a: u8, b: u8, c: u8, d: u8) -> Self {
+-        Self(bindings::in_addr {
+-            s_addr: u32::from_be_bytes([a, b, c, d]).to_be(),
+-        })
+-    }
+-}
+-
+-/// An IPv6 address.
+-///
+-/// This is equivalent to C's `in6_addr`.
+-#[repr(transparent)]
+-pub struct Ipv6Addr(bindings::in6_addr);
+-
+-impl Ipv6Addr {
+-    /// A wildcard IPv6 address.
+-    ///
+-    /// Binding to this address means binding to all IPv6 addresses.
+-    pub const ANY: Self = Self::new(0, 0, 0, 0, 0, 0, 0, 0);
+-
+-    /// The IPv6 loopback address.
+-    pub const LOOPBACK: Self = Self::new(0, 0, 0, 0, 0, 0, 0, 1);
+-
+-    /// Creates a new IPv6 address with the given components.
+-    #[allow(clippy::too_many_arguments)]
+-    pub const fn new(a: u16, b: u16, c: u16, d: u16, e: u16, f: u16, g: u16, h: u16) -> Self {
+-        Self(bindings::in6_addr {
+-            in6_u: bindings::in6_addr__bindgen_ty_1 {
+-                u6_addr16: [
+-                    a.to_be(),
+-                    b.to_be(),
+-                    c.to_be(),
+-                    d.to_be(),
+-                    e.to_be(),
+-                    f.to_be(),
+-                    g.to_be(),
+-                    h.to_be(),
+-                ],
+-            },
+-        })
+-    }
+-}
+-
+-/// A socket address.
+-///
+-/// It's an enum with either an IPv4 or IPv6 socket address.
+-pub enum SocketAddr {
+-    /// An IPv4 socket address.
+-    V4(SocketAddrV4),
+-
+-    /// An IPv6 socket address.
+-    V6(SocketAddrV6),
+-}
+-
+-/// An IPv4 socket address.
+-///
+-/// This is equivalent to C's `sockaddr_in`.
+-#[repr(transparent)]
+-pub struct SocketAddrV4(bindings::sockaddr_in);
+-
+-impl SocketAddrV4 {
+-    /// Creates a new IPv4 socket address.
+-    pub const fn new(addr: Ipv4Addr, port: u16) -> Self {
+-        Self(bindings::sockaddr_in {
+-            sin_family: bindings::AF_INET as _,
+-            sin_port: port.to_be(),
+-            sin_addr: addr.0,
+-            __pad: [0; 8],
+-        })
+-    }
+-}
+-
+-/// An IPv6 socket address.
+-///
+-/// This is equivalent to C's `sockaddr_in6`.
+-#[repr(transparent)]
+-pub struct SocketAddrV6(bindings::sockaddr_in6);
+-
+-impl SocketAddrV6 {
+-    /// Creates a new IPv6 socket address.
+-    pub const fn new(addr: Ipv6Addr, port: u16, flowinfo: u32, scopeid: u32) -> Self {
+-        Self(bindings::sockaddr_in6 {
+-            sin6_family: bindings::AF_INET6 as _,
+-            sin6_port: port.to_be(),
+-            sin6_addr: addr.0,
+-            sin6_flowinfo: flowinfo,
+-            sin6_scope_id: scopeid,
+-        })
+-    }
+-}
+-
+-/// A socket listening on a TCP port.
+-///
+-/// # Invariants
+-///
+-/// The socket pointer is always non-null and valid.
+-pub struct TcpListener {
+-    pub(crate) sock: *mut bindings::socket,
+-}
+-
+-// SAFETY: `TcpListener` is just a wrapper for a kernel socket, which can be used from any thread.
+-unsafe impl Send for TcpListener {}
+-
+-// SAFETY: `TcpListener` is just a wrapper for a kernel socket, which can be used from any thread.
+-unsafe impl Sync for TcpListener {}
+-
+-impl TcpListener {
+-    /// Creates a new TCP listener.
+-    ///
+-    /// It is configured to listen on the given socket address for the given namespace.
+-    pub fn try_new(ns: &Namespace, addr: &SocketAddr) -> Result<Self> {
+-        let mut socket = core::ptr::null_mut();
+-        let (pf, addr, addrlen) = match addr {
+-            SocketAddr::V4(addr) => (
+-                bindings::PF_INET,
+-                addr as *const _ as _,
+-                core::mem::size_of::<bindings::sockaddr_in>(),
+-            ),
+-            SocketAddr::V6(addr) => (
+-                bindings::PF_INET6,
+-                addr as *const _ as _,
+-                core::mem::size_of::<bindings::sockaddr_in6>(),
+-            ),
+-        };
+-
+-        // SAFETY: The namespace is valid and the output socket pointer is valid for write.
+-        to_result(unsafe {
+-            bindings::sock_create_kern(
+-                ns.0.get(),
+-                pf as _,
+-                bindings::sock_type_SOCK_STREAM as _,
+-                bindings::IPPROTO_TCP as _,
+-                &mut socket,
+-            )
+-        })?;
+-
+-        // INVARIANT: The socket was just created, so it is valid.
+-        let listener = Self { sock: socket };
+-
+-        // SAFETY: The type invariant guarantees that the socket is valid, and `addr` and `addrlen`
+-        // were initialised based on valid values provided in the address enum.
+-        to_result(unsafe { bindings::kernel_bind(socket, addr, addrlen as _) })?;
+-
+-        // SAFETY: The socket is valid per the type invariant.
+-        to_result(unsafe { bindings::kernel_listen(socket, bindings::SOMAXCONN as _) })?;
+-
+-        Ok(listener)
+-    }
+-
+-    /// Accepts a new connection.
+-    ///
+-    /// On success, returns the newly-accepted socket stream.
+-    ///
+-    /// If no connection is available to be accepted, one of two behaviours will occur:
+-    /// - If `block` is `false`, returns [`crate::error::code::EAGAIN`];
+-    /// - If `block` is `true`, blocks until an error occurs or some connection can be accepted.
+-    pub fn accept(&self, block: bool) -> Result<TcpStream> {
+-        let mut new = core::ptr::null_mut();
+-        let flags = if block { 0 } else { bindings::O_NONBLOCK };
+-        // SAFETY: The type invariant guarantees that the socket is valid, and the output argument
+-        // is also valid for write.
+-        to_result(unsafe { bindings::kernel_accept(self.sock, &mut new, flags as _) })?;
+-        Ok(TcpStream { sock: new })
+-    }
+-}
+-
+-impl Drop for TcpListener {
+-    fn drop(&mut self) {
+-        // SAFETY: The type invariant guarantees that the socket is valid.
+-        unsafe { bindings::sock_release(self.sock) };
+-    }
+-}
+-
+-/// A connected TCP socket.
+-///
+-/// # Invariants
+-///
+-/// The socket pointer is always non-null and valid.
+-pub struct TcpStream {
+-    pub(crate) sock: *mut bindings::socket,
+-}
+-
+-// SAFETY: `TcpStream` is just a wrapper for a kernel socket, which can be used from any thread.
+-unsafe impl Send for TcpStream {}
+-
+-// SAFETY: `TcpStream` is just a wrapper for a kernel socket, which can be used from any thread.
+-unsafe impl Sync for TcpStream {}
+-
+-impl TcpStream {
+-    /// Reads data from a connected socket.
+-    ///
+-    /// On success, returns the number of bytes read, which will be zero if the connection is
+-    /// closed.
+-    ///
+-    /// If no data is immediately available for reading, one of two behaviours will occur:
+-    /// - If `block` is `false`, returns [`crate::error::code::EAGAIN`];
+-    /// - If `block` is `true`, blocks until an error occurs, the connection is closed, or some
+-    ///   becomes readable.
+-    pub fn read(&self, buf: &mut [u8], block: bool) -> Result<usize> {
+-        let mut msg = bindings::msghdr::default();
+-        let mut vec = bindings::kvec {
+-            iov_base: buf.as_mut_ptr().cast(),
+-            iov_len: buf.len(),
+-        };
+-        // SAFETY: The type invariant guarantees that the socket is valid, and `vec` was
+-        // initialised with the output buffer.
+-        let r = unsafe {
+-            bindings::kernel_recvmsg(
+-                self.sock,
+-                &mut msg,
+-                &mut vec,
+-                1,
+-                vec.iov_len,
+-                if block { 0 } else { bindings::MSG_DONTWAIT } as _,
+-            )
+-        };
+-        if r < 0 {
+-            Err(Error::from_kernel_errno(r))
+-        } else {
+-            Ok(r as _)
+-        }
+-    }
+-
+-    /// Writes data to the connected socket.
+-    ///
+-    /// On success, returns the number of bytes written.
+-    ///
+-    /// If the send buffer of the socket is full, one of two behaviours will occur:
+-    /// - If `block` is `false`, returns [`crate::error::code::EAGAIN`];
+-    /// - If `block` is `true`, blocks until an error occurs or some data is written.
+-    pub fn write(&self, buf: &[u8], block: bool) -> Result<usize> {
+-        let mut msg = bindings::msghdr {
+-            msg_flags: if block { 0 } else { bindings::MSG_DONTWAIT },
+-            ..bindings::msghdr::default()
+-        };
+-        let mut vec = bindings::kvec {
+-            iov_base: buf.as_ptr() as *mut u8 as _,
+-            iov_len: buf.len(),
+-        };
+-        // SAFETY: The type invariant guarantees that the socket is valid, and `vec` was
+-        // initialised with the input  buffer.
+-        let r = unsafe { bindings::kernel_sendmsg(self.sock, &mut msg, &mut vec, 1, vec.iov_len) };
+-        if r < 0 {
+-            Err(Error::from_kernel_errno(r))
+-        } else {
+-            Ok(r as _)
+-        }
+-    }
+-}
+-
+-impl Drop for TcpStream {
+-    fn drop(&mut self) {
+-        // SAFETY: The type invariant guarantees that the socket is valid.
+-        unsafe { bindings::sock_release(self.sock) };
+-    }
+-}
+diff --git a/rust/kernel/net/device/flags.rs b/rust/kernel/net/device/flags.rs
+index fc4495d2c926..d9f68aeff067 100644
+--- a/rust/kernel/net/device/flags.rs
++++ b/rust/kernel/net/device/flags.rs
+@@ -209,69 +209,69 @@ pub enum Flag {
+ }
+ 
+ /// Iff private flags
+-#[repr(i32)]
+-#[allow(non_camel_case_types)]
+-pub enum PrivFlag {
+-    /// 802.1Q VLAN device.
+-    IFF_802_1Q_VLAN = bindings::netdev_priv_flags_IFF_802_1Q_VLAN, /* TODO: find a good name without leading 8 */
+-    /// Ethernet bridging device.
+-    EBRIDGE = bindings::netdev_priv_flags_IFF_EBRIDGE,
+-    /// Bonding master or slave.
+-    BONDING = bindings::netdev_priv_flags_IFF_BONDING,
+-    /// ISATAP interface (RFC4214).
+-    ISATAP = bindings::netdev_priv_flags_IFF_ISATAP,
+-    /// WAN HDLC device.
+-    WAN_HDLC = bindings::netdev_priv_flags_IFF_WAN_HDLC,
+-    /// dev_hard_start_xmit() is allowed to release skb->dst
+-    XMIT_DST_RELEASE = bindings::netdev_priv_flags_IFF_XMIT_DST_RELEASE,
+-    /// Disallow bridging this ether dev.
+-    DONT_BRIDGE = bindings::netdev_priv_flags_IFF_DONT_BRIDGE,
+-    /// Disable netpoll at run-time.
+-    DISABLE_NETPOLL = bindings::netdev_priv_flags_IFF_DISABLE_NETPOLL,
+-    /// Device used as macvlan port.
+-    MACVLAN_PORT = bindings::netdev_priv_flags_IFF_MACVLAN_PORT,
+-    /// Device used as bridge port.
+-    BRIDGE_PORT = bindings::netdev_priv_flags_IFF_BRIDGE_PORT,
+-    /// Device used as Open vSwitch datapath port.
+-    OVS_DATAPATH = bindings::netdev_priv_flags_IFF_OVS_DATAPATH,
+-    /// The interface supports sharing skbs on transmit.
+-    TX_SKB_SHARING = bindings::netdev_priv_flags_IFF_TX_SKB_SHARING,
+-    /// Supports unicast filtering.
+-    UNICAST_FLT = bindings::netdev_priv_flags_IFF_UNICAST_FLT,
+-    /// Device used as team port.
+-    TEAM_PORT = bindings::netdev_priv_flags_IFF_TEAM_PORT,
+-    /// Device supports sending custom FCS.
+-    SUPP_NOFCS = bindings::netdev_priv_flags_IFF_SUPP_NOFCS,
+-    /// Device supports hardware address change when it's running.
+-    LIVE_ADDR_CHANGE = bindings::netdev_priv_flags_IFF_LIVE_ADDR_CHANGE,
+-    /// Macvlan device.
+-    MACVLAN = bindings::netdev_priv_flags_IFF_MACVLAN,
+-    /// IFF_XMIT_DST_RELEASE not taking into account underlying stacked devices.
+-    XMIT_DST_RELEASE_PERM = bindings::netdev_priv_flags_IFF_XMIT_DST_RELEASE_PERM,
+-    /// Device is an L3 master device.
+-    L3MDEV_MASTER = bindings::netdev_priv_flags_IFF_L3MDEV_MASTER,
+-    /// Device can run without qdisc attached.
+-    NO_QUEUE = bindings::netdev_priv_flags_IFF_NO_QUEUE,
+-    /// Device is a Open vSwitch master.
+-    OPENVSWITCH = bindings::netdev_priv_flags_IFF_OPENVSWITCH,
+-    /// Device is enslaved to an L3 master device.
+-    L3MDEV_SLAVE = bindings::netdev_priv_flags_IFF_L3MDEV_SLAVE,
+-    /// Device is a team device.
+-    TEAM = bindings::netdev_priv_flags_IFF_TEAM,
+-    /// Device has had Rx Flow indirection table configured.
+-    RXFH_CONFIGURED = bindings::netdev_priv_flags_IFF_RXFH_CONFIGURED,
+-    /// The headroom value is controlled by an external entity (i.e. the master device for bridged veth).
+-    PHONY_HEADROOM = bindings::netdev_priv_flags_IFF_PHONY_HEADROOM,
+-    /// Device is a MACsec device.
+-    MACSEC = bindings::netdev_priv_flags_IFF_MACSEC,
+-    /// Device doesn't support the rx_handler hook.
+-    NO_RX_HANDLER = bindings::netdev_priv_flags_IFF_NO_RX_HANDLER,
+-    /// Device is a failover master device.
+-    FAILOVER = bindings::netdev_priv_flags_IFF_FAILOVER,
+-    /// Device is lower dev of a failover master device.
+-    FAILOVER_SLAVE = bindings::netdev_priv_flags_IFF_FAILOVER_SLAVE,
+-    /// Only invoke the rx handler of L3 master device.
+-    L3MDEV_RX_HANDLER = bindings::netdev_priv_flags_IFF_L3MDEV_RX_HANDLER,
+-    /// Rename is allowed while device is up and running.
+-    LIVE_RENAME_OK = bindings::netdev_priv_flags_IFF_LIVE_RENAME_OK,
++pub mod priv_flag {
++pub type PrivFlag=u64;
++
++/// 802.1Q VLAN device.
++pub const IFF_802_1Q_VLAN:PrivFlag = bindings::netdev_priv_flags_IFF_802_1Q_VLAN; /* TODO: find a good name without leading 8 */
++/// Ethernet bridging device.
++pub const EBRIDGE:PrivFlag = bindings::netdev_priv_flags_IFF_EBRIDGE;
++/// Bonding master or slave.
++pub const BONDING:PrivFlag = bindings::netdev_priv_flags_IFF_BONDING;
++/// ISATAP interface (RFC4214).
++pub const ISATAP:PrivFlag = bindings::netdev_priv_flags_IFF_ISATAP;
++/// WAN HDLC device.
++pub const WAN_HDLC:PrivFlag = bindings::netdev_priv_flags_IFF_WAN_HDLC;
++/// dev_hard_start_xmit() is allowed to release skb->dst
++pub const XMIT_DST_RELEASE:PrivFlag = bindings::netdev_priv_flags_IFF_XMIT_DST_RELEASE;
++/// Disallow bridging this ether dev.
++pub const DONT_BRIDGE:PrivFlag = bindings::netdev_priv_flags_IFF_DONT_BRIDGE;
++/// Disable netpoll at run-time.
++pub const DISABLE_NETPOLL:PrivFlag = bindings::netdev_priv_flags_IFF_DISABLE_NETPOLL;
++/// Device used as macvlan port.
++pub const MACVLAN_PORT:PrivFlag = bindings::netdev_priv_flags_IFF_MACVLAN_PORT;
++/// Device used as bridge port.
++pub const BRIDGE_PORT:PrivFlag = bindings::netdev_priv_flags_IFF_BRIDGE_PORT;
++/// Device used as Open vSwitch datapath port.
++pub const OVS_DATAPATH:PrivFlag = bindings::netdev_priv_flags_IFF_OVS_DATAPATH;
++/// The interface supports sharing skbs on transmit.
++pub const TX_SKB_SHARING:PrivFlag = bindings::netdev_priv_flags_IFF_TX_SKB_SHARING;
++/// Supports unicast filtering.
++pub const UNICAST_FLT:PrivFlag = bindings::netdev_priv_flags_IFF_UNICAST_FLT;
++/// Device used as team port.
++pub const TEAM_PORT:PrivFlag = bindings::netdev_priv_flags_IFF_TEAM_PORT;
++/// Device supports sending custom FCS.
++pub const SUPP_NOFCS:PrivFlag = bindings::netdev_priv_flags_IFF_SUPP_NOFCS;
++/// Device supports hardware address change when it's running.
++pub const LIVE_ADDR_CHANGE:PrivFlag = bindings::netdev_priv_flags_IFF_LIVE_ADDR_CHANGE;
++/// Macvlan device.
++pub const MACVLAN:PrivFlag = bindings::netdev_priv_flags_IFF_MACVLAN;
++/// IFF_XMIT_DST_RELEASE not taking into account underlying stacked devices.
++pub const XMIT_DST_RELEASE_PERM:PrivFlag = bindings::netdev_priv_flags_IFF_XMIT_DST_RELEASE_PERM;
++/// Device is an L3 master device.
++pub const L3MDEV_MASTER:PrivFlag = bindings::netdev_priv_flags_IFF_L3MDEV_MASTER;
++/// Device can run without qdisc attached.
++pub const NO_QUEUE:PrivFlag = bindings::netdev_priv_flags_IFF_NO_QUEUE;
++/// Device is a Open vSwitch master.
++pub const OPENVSWITCH:PrivFlag = bindings::netdev_priv_flags_IFF_OPENVSWITCH;
++/// Device is enslaved to an L3 master device.
++pub const L3MDEV_SLAVE:PrivFlag = bindings::netdev_priv_flags_IFF_L3MDEV_SLAVE;
++/// Device is a team device.
++pub const TEAM:PrivFlag = bindings::netdev_priv_flags_IFF_TEAM;
++/// Device has had Rx Flow indirection table configured.
++pub const RXFH_CONFIGURED:PrivFlag = bindings::netdev_priv_flags_IFF_RXFH_CONFIGURED;
++/// The headroom value is controlled by an external entity (i.e. the master device for bridged veth).
++pub const PHONY_HEADROOM:PrivFlag = bindings::netdev_priv_flags_IFF_PHONY_HEADROOM;
++/// Device is a MACsec device.
++pub const MACSEC:PrivFlag = bindings::netdev_priv_flags_IFF_MACSEC;
++/// Device doesn't support the rx_handler hook.
++pub const NO_RX_HANDLER:PrivFlag = bindings::netdev_priv_flags_IFF_NO_RX_HANDLER;
++/// Device is a failover master device.
++pub const FAILOVER:PrivFlag = bindings::netdev_priv_flags_IFF_FAILOVER;
++/// Device is lower dev of a failover master device.
++pub const FAILOVER_SLAVE:PrivFlag = bindings::netdev_priv_flags_IFF_FAILOVER_SLAVE;
++/// Only invoke the rx handler of L3 master device.
++pub const L3MDEV_RX_HANDLER:PrivFlag = bindings::netdev_priv_flags_IFF_L3MDEV_RX_HANDLER;
++/// Rename is allowed while device is up and running.
++pub const LIVE_RENAME_OK:PrivFlag = bindings::netdev_priv_flags_IFF_LIVE_RENAME_OK;
+ }
+diff --git a/rust/kernel/net/device/mod.rs b/rust/kernel/net/device/mod.rs
+index de92c1524b72..8de74be6dd50 100644
+--- a/rust/kernel/net/device/mod.rs
++++ b/rust/kernel/net/device/mod.rs
+@@ -7,15 +7,14 @@
+ mod flags;
+ 
+ #[doc(inline)]
+-pub use flags::{Features, Flag, PrivFlag};
++pub use flags::{Features, Flag, priv_flag::{self, PrivFlag}};
+ 
+ use core::{marker, mem, ptr};
+ 
+ use crate::bindings;
+-use crate::error::{Error, Result};
+-use crate::from_kernel_result;
++use crate::error::{Error, Result, from_kernel_result, code};
+ use crate::types::{SavedAsPointer, SavedAsPointerMut};
+-use crate::{c_types, str::CStr};
++use crate::str::CStr;
+ 
+ use super::ethtool::EthToolOps;
+ use super::rtnl::{RtnlLinkStats64, RtnlLock};
+@@ -24,13 +23,13 @@ use core::convert::TryFrom;
+ 
+ extern "C" {
+     #[allow(improper_ctypes)]
+-    fn rust_helper_netdev_priv(dev: *const bindings::net_device) -> *mut c_types::c_void;
++    fn rust_helper_netdev_priv(dev: *const bindings::net_device) -> *mut core::ffi::c_void;
+ 
+     #[allow(improper_ctypes)]
+     fn rust_helper_eth_hw_addr_random(dev: *const bindings::net_device);
+ 
+     #[allow(improper_ctypes)]
+-    fn rust_helper_net_device_set_new_lstats(dev: *mut bindings::net_device) -> c_types::c_int;
++    fn rust_helper_net_device_set_new_lstats(dev: *mut bindings::net_device) -> core::ffi::c_int;
+ 
+     #[allow(improper_ctypes)]
+     fn rust_helper_dev_lstats_add(dev: *mut bindings::net_device, len: u32);
+@@ -95,7 +94,7 @@ impl<T: NetDeviceAdapter> NetDevice<T> {
+         rxqs: u32,
+     ) -> Result<Self> {
+         if txqs < 1 || rxqs < 1 {
+-            return Err(Error::EINVAL);
++            return Err(code::EINVAL);
+         }
+         let size = mem::size_of::<T>() as i32;
+ 
+@@ -110,7 +109,7 @@ impl<T: NetDeviceAdapter> NetDevice<T> {
+             )
+         };
+         if ptr.is_null() {
+-            return Err(Error::ENOMEM);
++            return Err(code::ENOMEM);
+         }
+ 
+         if size != 0 {
+@@ -255,14 +254,14 @@ impl<T: NetDeviceAdapter> NetDevice<T> {
+     pub fn add_private_flag(&mut self, flag: PrivFlag) {
+         let mut dev = self.get_internal_mut();
+ 
+-        dev.priv_flags |= flag as u32;
++        dev.priv_flags |= flag;
+     }
+ 
+     /// Remove a [`PrivFlag`] private_flag from the [`NetDevice`].
+     pub fn remove_private_flag(&mut self, flag: PrivFlag) {
+         let mut dev = self.get_internal_mut();
+ 
+-        dev.priv_flags &= !(flag as u32);
++        dev.priv_flags &= !flag;
+     }
+ 
+     /// Set a [`Features`] `feature` set to the [`NetDevice`].
+@@ -435,7 +434,7 @@ pub enum NetdevTX {
+ 
+ unsafe extern "C" fn ndo_init_callback<T: NetDeviceAdapter>(
+     dev: *mut bindings::net_device,
+-) -> c_types::c_int {
++) -> core::ffi::c_int {
+     from_kernel_result! {
+         T::Ops::init(
+             unsafe { &mut NetDevice::<T>::from_pointer_mut(dev) }
+@@ -471,7 +470,7 @@ unsafe extern "C" fn ndo_get_stats64_callback<T: NetDeviceAdapter>(
+ unsafe extern "C" fn ndo_change_carrier_callback<T: NetDeviceAdapter>(
+     dev: *mut bindings::net_device,
+     change_carrier: bool,
+-) -> c_types::c_int {
++) -> core::ffi::c_int {
+     from_kernel_result! {
+         T::Ops::change_carrier(
+             unsafe { &mut NetDevice::<T>::from_pointer_mut(dev) },
+@@ -483,7 +482,7 @@ unsafe extern "C" fn ndo_change_carrier_callback<T: NetDeviceAdapter>(
+ 
+ unsafe extern "C" fn ndo_validate_addr_callback<T: NetDeviceAdapter>(
+     dev: *mut bindings::net_device,
+-) -> c_types::c_int {
++) -> core::ffi::c_int {
+     from_kernel_result! {
+         T::Ops::validate_addr(
+             unsafe { &mut NetDevice::<T>::from_pointer_mut(dev) }
+@@ -494,8 +493,8 @@ unsafe extern "C" fn ndo_validate_addr_callback<T: NetDeviceAdapter>(
+ 
+ unsafe extern "C" fn ndo_set_mac_address_callback<T: NetDeviceAdapter>(
+     dev: *mut bindings::net_device,
+-    p: *mut c_types::c_void,
+-) -> c_types::c_int {
++    p: *mut core::ffi::c_void,
++) -> core::ffi::c_int {
+     from_kernel_result! {
+         T::Ops::set_mac_addr(
+             unsafe { &mut NetDevice::<T>::from_pointer_mut(dev) },
+@@ -513,6 +512,13 @@ pub(crate) struct NetDeviceOperationsVtable<T: NetDeviceAdapter>(marker::Phantom
+ 
+ impl<T: NetDeviceAdapter> NetDeviceOperationsVtable<T> {
+     const VTABLE: bindings::net_device_ops = bindings::net_device_ops {
++        ndo_eth_ioctl: None,
++        ndo_fdb_del_bulk: None,
++        ndo_get_tstamp: None,
++        ndo_siocbond: None,
++        ndo_siocdevprivate: None,
++        ndo_siocwandev: None,
++        ndo_xdp_get_xmit_slave: None,
+         ndo_init: Some(ndo_init_callback::<T>),
+         ndo_uninit: Some(ndo_uninit_callback::<T>),
+         ndo_open: None,
+@@ -620,7 +626,6 @@ impl<T: NetDeviceAdapter> NetDeviceOperationsVtable<T> {
+         ndo_dfwd_del_station: None,
+         ndo_set_tx_maxrate: None,
+         ndo_get_iflink: None,
+-        ndo_change_proto_down: None,
+         ndo_fill_metadata_dst: None,
+         ndo_set_rx_headroom: None,
+         ndo_bpf: None,
+@@ -731,21 +736,21 @@ pub trait NetDeviceOps<T: NetDeviceAdapter>: Send + Sync + Sized {
+     /// therefor NOT set [`TO_USE.change_carrier`].
+     #[allow(unused_variables)]
+     fn change_carrier(dev: &mut NetDevice<T>, new_carrier: bool) -> Result {
+-        Err(Error::EINVAL)
++        Err(code::EINVAL)
+     }
+ 
+     /// Test if Media Access Control address is valid for the device.
+     #[allow(unused_variables)]
+     fn validate_addr(dev: &mut NetDevice<T>) -> Result {
+-        Err(Error::EINVAL)
++        Err(code::EINVAL)
+     }
+ 
+     /// This function  is called when the Media Access Control address
+     /// needs to be changed. If this interface is not defined, the
+     /// MAC address can not be changed.
+     #[allow(unused_variables)]
+-    fn set_mac_addr(dev: &mut NetDevice<T>, p: *mut c_types::c_void) -> Result {
+-        Err(Error::EINVAL)
++    fn set_mac_addr(dev: &mut NetDevice<T>, p: *mut core::ffi::c_void) -> Result {
++        Err(code::EINVAL)
+     }
+ 
+     /// This function is called device changes address list filtering.
+@@ -780,7 +785,7 @@ pub mod helpers {
+     /// `socket_addr` has to be a valid socket address pointer.
+     pub unsafe fn eth_mac_addr<T: NetDeviceAdapter>(
+         dev: &mut NetDevice<T>,
+-        socket_addr: *mut c_types::c_void,
++        socket_addr: *mut core::ffi::c_void,
+     ) -> Result {
+         // SAFETY: Calling a C function .
+         let ret = unsafe { bindings::eth_mac_addr(dev.get_pointer_mut(), socket_addr) };
+diff --git a/rust/kernel/net/ethtool.rs b/rust/kernel/net/ethtool.rs
+index 1214a8768039..c8fef0a76e45 100644
+--- a/rust/kernel/net/ethtool.rs
++++ b/rust/kernel/net/ethtool.rs
+@@ -4,9 +4,9 @@
+ 
+ use core::marker;
+ 
+-use crate::error::{Error, Result};
++use crate::error::{self, Result, from_kernel_result};
+ use crate::types::{SavedAsPointer, SavedAsPointerMut};
+-use crate::{bindings, c_types, from_kernel_result};
++use crate::bindings;
+ 
+ use super::device::{NetDevice, NetDeviceAdapter};
+ 
+@@ -23,7 +23,7 @@ unsafe extern "C" fn get_drvinfo_callback<T: NetDeviceAdapter>(
+ unsafe extern "C" fn get_ts_info_callback<T: NetDeviceAdapter>(
+     dev: *mut bindings::net_device,
+     info: *mut bindings::ethtool_ts_info,
+-) -> c_types::c_int {
++) -> core::ffi::c_int {
+     from_kernel_result! {
+         T::EthOps::get_ts_info(
+             // SAFETY: dev is valid, as this is a callback
+@@ -39,7 +39,10 @@ pub(crate) struct EthToolOperationsVtable<T: NetDeviceAdapter>(marker::PhantomDa
+ 
+ impl<T: NetDeviceAdapter> EthToolOperationsVtable<T> {
+     const VTABLE: bindings::ethtool_ops = bindings::ethtool_ops {
+-        _bitfield_1: bindings::__BindgenBitfieldUnit::<[u8; 1usize], u8>::new([0u8; 1usize]),
++        get_module_power_mode: None,
++        set_module_power_mode: None,
++        supported_ring_params: 0,
++        _bitfield_1: bindings::__BindgenBitfieldUnit::new([0u8; 1usize]),
+ 
+         supported_coalesce_params: 0,
+         get_drvinfo: if T::EthOps::TO_USE.get_drvinfo {
+@@ -178,7 +181,7 @@ pub trait EthToolOps<T: NetDeviceAdapter>: Send + Sync + Sized {
+     /// [`helpers::ethtool_op_get_ts_info`].
+     #[allow(unused_variables)]
+     fn get_ts_info(dev: &mut NetDevice<T>, info: &mut EthToolTsInfo) -> Result {
+-        Err(Error::EINVAL)
++        Err(error::code::EINVAL)
+     }
+ }
+ 
+diff --git a/rust/kernel/net/mod.rs b/rust/kernel/net/mod.rs
+index f55944a5e039..b0c7331ccee9 100644
+--- a/rust/kernel/net/mod.rs
++++ b/rust/kernel/net/mod.rs
+@@ -1,6 +1,398 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
+-//! Network subsystem in rust for linux kernel.
++//! Networking core.
++//!
++//! C headers: [`include/net/net_namespace.h`](../../../../include/linux/net/net_namespace.h),
++//! [`include/linux/netdevice.h`](../../../../include/linux/netdevice.h),
++//! [`include/linux/skbuff.h`](../../../../include/linux/skbuff.h).
++
++use crate::{bindings, str::CStr, to_result, ARef, AlwaysRefCounted, Error, Result};
++use core::{cell::UnsafeCell, ptr::NonNull};
++
++#[cfg(CONFIG_NETFILTER)]
++pub mod filter;
++
++/// Wraps the kernel's `struct net_device`.
++#[repr(transparent)]
++pub struct Device(UnsafeCell<bindings::net_device>);
++
++// SAFETY: Instances of `Device` are created on the C side. They are always refcounted.
++unsafe impl AlwaysRefCounted for Device {
++    fn inc_ref(&self) {
++        // SAFETY: The existence of a shared reference means that the refcount is nonzero.
++        unsafe { bindings::dev_hold(self.0.get()) };
++    }
++
++    unsafe fn dec_ref(obj: core::ptr::NonNull<Self>) {
++        // SAFETY: The safety requirements guarantee that the refcount is nonzero.
++        unsafe { bindings::dev_put(obj.cast().as_ptr()) };
++    }
++}
++
++/// Wraps the kernel's `struct net`.
++#[repr(transparent)]
++pub struct Namespace(UnsafeCell<bindings::net>);
++
++impl Namespace {
++    /// Finds a network device with the given name in the namespace.
++    pub fn dev_get_by_name(&self, name: &CStr) -> Option<ARef<Device>> {
++        // SAFETY: The existence of a shared reference guarantees the refcount is nonzero.
++        let ptr =
++            NonNull::new(unsafe { bindings::dev_get_by_name(self.0.get(), name.as_char_ptr()) })?;
++        Some(unsafe { ARef::from_raw(ptr.cast()) })
++    }
++}
++
++// SAFETY: Instances of `Namespace` are created on the C side. They are always refcounted.
++unsafe impl AlwaysRefCounted for Namespace {
++    fn inc_ref(&self) {
++        // SAFETY: The existence of a shared reference means that the refcount is nonzero.
++        unsafe { bindings::get_net(self.0.get()) };
++    }
++
++    unsafe fn dec_ref(obj: core::ptr::NonNull<Self>) {
++        // SAFETY: The safety requirements guarantee that the refcount is nonzero.
++        unsafe { bindings::put_net(obj.cast().as_ptr()) };
++    }
++}
++
++/// Returns the network namespace for the `init` process.
++pub fn init_ns() -> &'static Namespace {
++    unsafe { &*core::ptr::addr_of!(bindings::init_net).cast() }
++}
++
++/// Wraps the kernel's `struct sk_buff`.
++#[repr(transparent)]
++pub struct SkBuff(UnsafeCell<bindings::sk_buff>);
++
++impl SkBuff {
++    /// Creates a reference to an [`SkBuff`] from a valid pointer.
++    ///
++    /// # Safety
++    ///
++    /// The caller must ensure that `ptr` is valid and remains valid for the lifetime of the
++    /// returned [`SkBuff`] instance.
++    pub unsafe fn from_ptr<'a>(ptr: *const bindings::sk_buff) -> &'a SkBuff {
++        // SAFETY: The safety requirements guarantee the validity of the dereference, while the
++        // `SkBuff` type being transparent makes the cast ok.
++        unsafe { &*ptr.cast() }
++    }
++
++    /// Returns the remaining data in the buffer's first segment.
++    pub fn head_data(&self) -> &[u8] {
++        // SAFETY: The existence of a shared reference means that the refcount is nonzero.
++        let headlen = unsafe { bindings::skb_headlen(self.0.get()) };
++        let len = headlen.try_into().unwrap_or(usize::MAX);
++        // SAFETY: The existence of a shared reference means `self.0` is valid.
++        let data = unsafe { core::ptr::addr_of!((*self.0.get()).data).read() };
++        // SAFETY: The `struct sk_buff` conventions guarantee that at least `skb_headlen(skb)` bytes
++        // are valid from `skb->data`.
++        unsafe { core::slice::from_raw_parts(data, len) }
++    }
++
++    /// Returns the total length of the data (in all segments) in the skb.
++    #[allow(clippy::len_without_is_empty)]
++    pub fn len(&self) -> u32 {
++        // SAFETY: The existence of a shared reference means `self.0` is valid.
++        unsafe { core::ptr::addr_of!((*self.0.get()).len).read() }
++    }
++}
++
++// SAFETY: Instances of `SkBuff` are created on the C side. They are always refcounted.
++unsafe impl AlwaysRefCounted for SkBuff {
++    fn inc_ref(&self) {
++        // SAFETY: The existence of a shared reference means that the refcount is nonzero.
++        unsafe { bindings::skb_get(self.0.get()) };
++    }
++
++    unsafe fn dec_ref(obj: core::ptr::NonNull<Self>) {
++        // SAFETY: The safety requirements guarantee that the refcount is nonzero.
++        unsafe {
++            bindings::kfree_skb_reason(
++                obj.cast().as_ptr(),
++                bindings::skb_drop_reason_SKB_DROP_REASON_NOT_SPECIFIED,
++            )
++        };
++    }
++}
++
++/// An IPv4 address.
++///
++/// This is equivalent to C's `in_addr`.
++#[repr(transparent)]
++pub struct Ipv4Addr(bindings::in_addr);
++
++impl Ipv4Addr {
++    /// A wildcard IPv4 address.
++    ///
++    /// Binding to this address means binding to all IPv4 addresses.
++    pub const ANY: Self = Self::new(0, 0, 0, 0);
++
++    /// The IPv4 loopback address.
++    pub const LOOPBACK: Self = Self::new(127, 0, 0, 1);
++
++    /// The IPv4 broadcast address.
++    pub const BROADCAST: Self = Self::new(255, 255, 255, 255);
++
++    /// Creates a new IPv4 address with the given components.
++    pub const fn new(a: u8, b: u8, c: u8, d: u8) -> Self {
++        Self(bindings::in_addr {
++            s_addr: u32::from_be_bytes([a, b, c, d]).to_be(),
++        })
++    }
++}
++
++/// An IPv6 address.
++///
++/// This is equivalent to C's `in6_addr`.
++#[repr(transparent)]
++pub struct Ipv6Addr(bindings::in6_addr);
++
++impl Ipv6Addr {
++    /// A wildcard IPv6 address.
++    ///
++    /// Binding to this address means binding to all IPv6 addresses.
++    pub const ANY: Self = Self::new(0, 0, 0, 0, 0, 0, 0, 0);
++
++    /// The IPv6 loopback address.
++    pub const LOOPBACK: Self = Self::new(0, 0, 0, 0, 0, 0, 0, 1);
++
++    /// Creates a new IPv6 address with the given components.
++    #[allow(clippy::too_many_arguments)]
++    pub const fn new(a: u16, b: u16, c: u16, d: u16, e: u16, f: u16, g: u16, h: u16) -> Self {
++        Self(bindings::in6_addr {
++            in6_u: bindings::in6_addr__bindgen_ty_1 {
++                u6_addr16: [
++                    a.to_be(),
++                    b.to_be(),
++                    c.to_be(),
++                    d.to_be(),
++                    e.to_be(),
++                    f.to_be(),
++                    g.to_be(),
++                    h.to_be(),
++                ],
++            },
++        })
++    }
++}
++
++/// A socket address.
++///
++/// It's an enum with either an IPv4 or IPv6 socket address.
++pub enum SocketAddr {
++    /// An IPv4 socket address.
++    V4(SocketAddrV4),
++
++    /// An IPv6 socket address.
++    V6(SocketAddrV6),
++}
++
++/// An IPv4 socket address.
++///
++/// This is equivalent to C's `sockaddr_in`.
++#[repr(transparent)]
++pub struct SocketAddrV4(bindings::sockaddr_in);
++
++impl SocketAddrV4 {
++    /// Creates a new IPv4 socket address.
++    pub const fn new(addr: Ipv4Addr, port: u16) -> Self {
++        Self(bindings::sockaddr_in {
++            sin_family: bindings::AF_INET as _,
++            sin_port: port.to_be(),
++            sin_addr: addr.0,
++            __pad: [0; 8],
++        })
++    }
++}
++
++/// An IPv6 socket address.
++///
++/// This is equivalent to C's `sockaddr_in6`.
++#[repr(transparent)]
++pub struct SocketAddrV6(bindings::sockaddr_in6);
++
++impl SocketAddrV6 {
++    /// Creates a new IPv6 socket address.
++    pub const fn new(addr: Ipv6Addr, port: u16, flowinfo: u32, scopeid: u32) -> Self {
++        Self(bindings::sockaddr_in6 {
++            sin6_family: bindings::AF_INET6 as _,
++            sin6_port: port.to_be(),
++            sin6_addr: addr.0,
++            sin6_flowinfo: flowinfo,
++            sin6_scope_id: scopeid,
++        })
++    }
++}
++
++/// A socket listening on a TCP port.
++///
++/// # Invariants
++///
++/// The socket pointer is always non-null and valid.
++pub struct TcpListener {
++    pub(crate) sock: *mut bindings::socket,
++}
++
++// SAFETY: `TcpListener` is just a wrapper for a kernel socket, which can be used from any thread.
++unsafe impl Send for TcpListener {}
++
++// SAFETY: `TcpListener` is just a wrapper for a kernel socket, which can be used from any thread.
++unsafe impl Sync for TcpListener {}
++
++impl TcpListener {
++    /// Creates a new TCP listener.
++    ///
++    /// It is configured to listen on the given socket address for the given namespace.
++    pub fn try_new(ns: &Namespace, addr: &SocketAddr) -> Result<Self> {
++        let mut socket = core::ptr::null_mut();
++        let (pf, addr, addrlen) = match addr {
++            SocketAddr::V4(addr) => (
++                bindings::PF_INET,
++                addr as *const _ as _,
++                core::mem::size_of::<bindings::sockaddr_in>(),
++            ),
++            SocketAddr::V6(addr) => (
++                bindings::PF_INET6,
++                addr as *const _ as _,
++                core::mem::size_of::<bindings::sockaddr_in6>(),
++            ),
++        };
++
++        // SAFETY: The namespace is valid and the output socket pointer is valid for write.
++        to_result(unsafe {
++            bindings::sock_create_kern(
++                ns.0.get(),
++                pf as _,
++                bindings::sock_type_SOCK_STREAM as _,
++                bindings::IPPROTO_TCP as _,
++                &mut socket,
++            )
++        })?;
++
++        // INVARIANT: The socket was just created, so it is valid.
++        let listener = Self { sock: socket };
++
++        // SAFETY: The type invariant guarantees that the socket is valid, and `addr` and `addrlen`
++        // were initialised based on valid values provided in the address enum.
++        to_result(unsafe { bindings::kernel_bind(socket, addr, addrlen as _) })?;
++
++        // SAFETY: The socket is valid per the type invariant.
++        to_result(unsafe { bindings::kernel_listen(socket, bindings::SOMAXCONN as _) })?;
++
++        Ok(listener)
++    }
++
++    /// Accepts a new connection.
++    ///
++    /// On success, returns the newly-accepted socket stream.
++    ///
++    /// If no connection is available to be accepted, one of two behaviours will occur:
++    /// - If `block` is `false`, returns [`crate::error::code::EAGAIN`];
++    /// - If `block` is `true`, blocks until an error occurs or some connection can be accepted.
++    pub fn accept(&self, block: bool) -> Result<TcpStream> {
++        let mut new = core::ptr::null_mut();
++        let flags = if block { 0 } else { bindings::O_NONBLOCK };
++        // SAFETY: The type invariant guarantees that the socket is valid, and the output argument
++        // is also valid for write.
++        to_result(unsafe { bindings::kernel_accept(self.sock, &mut new, flags as _) })?;
++        Ok(TcpStream { sock: new })
++    }
++}
++
++impl Drop for TcpListener {
++    fn drop(&mut self) {
++        // SAFETY: The type invariant guarantees that the socket is valid.
++        unsafe { bindings::sock_release(self.sock) };
++    }
++}
++
++/// A connected TCP socket.
++///
++/// # Invariants
++///
++/// The socket pointer is always non-null and valid.
++pub struct TcpStream {
++    pub(crate) sock: *mut bindings::socket,
++}
++
++// SAFETY: `TcpStream` is just a wrapper for a kernel socket, which can be used from any thread.
++unsafe impl Send for TcpStream {}
++
++// SAFETY: `TcpStream` is just a wrapper for a kernel socket, which can be used from any thread.
++unsafe impl Sync for TcpStream {}
++
++impl TcpStream {
++    /// Reads data from a connected socket.
++    ///
++    /// On success, returns the number of bytes read, which will be zero if the connection is
++    /// closed.
++    ///
++    /// If no data is immediately available for reading, one of two behaviours will occur:
++    /// - If `block` is `false`, returns [`crate::error::code::EAGAIN`];
++    /// - If `block` is `true`, blocks until an error occurs, the connection is closed, or some
++    ///   becomes readable.
++    pub fn read(&self, buf: &mut [u8], block: bool) -> Result<usize> {
++        let mut msg = bindings::msghdr::default();
++        let mut vec = bindings::kvec {
++            iov_base: buf.as_mut_ptr().cast(),
++            iov_len: buf.len(),
++        };
++        // SAFETY: The type invariant guarantees that the socket is valid, and `vec` was
++        // initialised with the output buffer.
++        let r = unsafe {
++            bindings::kernel_recvmsg(
++                self.sock,
++                &mut msg,
++                &mut vec,
++                1,
++                vec.iov_len,
++                if block { 0 } else { bindings::MSG_DONTWAIT } as _,
++            )
++        };
++        if r < 0 {
++            Err(Error::from_kernel_errno(r))
++        } else {
++            Ok(r as _)
++        }
++    }
++
++    /// Writes data to the connected socket.
++    ///
++    /// On success, returns the number of bytes written.
++    ///
++    /// If the send buffer of the socket is full, one of two behaviours will occur:
++    /// - If `block` is `false`, returns [`crate::error::code::EAGAIN`];
++    /// - If `block` is `true`, blocks until an error occurs or some data is written.
++    pub fn write(&self, buf: &[u8], block: bool) -> Result<usize> {
++        let mut msg = bindings::msghdr {
++            msg_flags: if block { 0 } else { bindings::MSG_DONTWAIT },
++            ..bindings::msghdr::default()
++        };
++        let mut vec = bindings::kvec {
++            iov_base: buf.as_ptr() as *mut u8 as _,
++            iov_len: buf.len(),
++        };
++        // SAFETY: The type invariant guarantees that the socket is valid, and `vec` was
++        // initialised with the input  buffer.
++        let r = unsafe { bindings::kernel_sendmsg(self.sock, &mut msg, &mut vec, 1, vec.iov_len) };
++        if r < 0 {
++            Err(Error::from_kernel_errno(r))
++        } else {
++            Ok(r as _)
++        }
++    }
++}
++
++impl Drop for TcpStream {
++    fn drop(&mut self) {
++        // SAFETY: The type invariant guarantees that the socket is valid.
++        unsafe { bindings::sock_release(self.sock) };
++    }
++}
++/*****************************************************
++ ****************** from net/mod.rs*******************
++ ****************************************************/
+ 
+ use core::mem;
+ 
+@@ -107,3 +499,4 @@ pub mod prelude {
+         skbuff::SkBuff,
+     };
+ }
++
+diff --git a/rust/kernel/net/rtnl.rs b/rust/kernel/net/rtnl.rs
+index 566f546bc1cd..fd5b0b298e43 100644
+--- a/rust/kernel/net/rtnl.rs
++++ b/rust/kernel/net/rtnl.rs
+@@ -42,6 +42,7 @@ pub const RTNL_LINK_OPS_EMPTY: bindings::rtnl_link_ops = bindings::rtnl_link_ops
+         next: ptr::null::<bindings::list_head>() as *mut bindings::list_head,
+         prev: ptr::null::<bindings::list_head>() as *mut bindings::list_head,
+     },
++    alloc: None,
+     kind: ptr::null::<i8>(),
+     priv_size: 0,
+     setup: None,
+diff --git a/rust/macros/helpers.rs b/rust/macros/helpers.rs
+index 94d3fef71f5e..856d8a8a5ca7 100644
+--- a/rust/macros/helpers.rs
++++ b/rust/macros/helpers.rs
+@@ -76,11 +76,12 @@ pub(crate) fn expect_string_ascii(it: &mut token_stream::IntoIter) -> String {
+     let string = try_string(it).expect("Expected string");
+     assert!(string.is_ascii(), "Expected ASCII string");
+     string
+-/* DEBUG_CONFLICT
++}
+ pub(crate) fn expect_byte_string(it: &mut token_stream::IntoIter) -> String {
+     try_byte_string(it).expect("Expected byte string")
+ }
+ 
++/* DEBUG_CONFLICT
+ #[derive(Clone, PartialEq)]
+ pub(crate) enum ParamType {
+     Ident(String),
+@@ -142,7 +143,7 @@ pub(crate) fn get_string(it: &mut token_stream::IntoIter, expected_name: &str) -
+     let string = expect_string(it);
+     assert_eq!(expect_punct(it), ',');
+     string
+-/* DEBUG_CONFLICT
++}
+ pub(crate) fn get_byte_string(it: &mut token_stream::IntoIter, expected_name: &str) -> String {
+     assert_eq!(expect_ident(it), expected_name);
+     assert_eq!(expect_punct(it), ':');
+@@ -150,4 +151,3 @@ pub(crate) fn get_byte_string(it: &mut token_stream::IntoIter, expected_name: &s
+     assert_eq!(expect_punct(it), ',');
+     byte_string
+ }
+-*/
+diff --git a/rust/macros/net.rs b/rust/macros/net.rs
+index 7c719d318909..b973dd2714a6 100644
+--- a/rust/macros/net.rs
++++ b/rust/macros/net.rs
+@@ -3,7 +3,7 @@ use proc_macro::{TokenStream, TokenTree};
+ 
+ use super::helpers::*;
+ 
+-pub fn rtnl_link_ops(ts: TokenStream) -> TokenStream {
++pub(crate) fn rtnl_link_ops(ts: TokenStream) -> TokenStream {
+     let mut it = ts.into_iter();
+     let literals = &["maxtype", "policy", "slave_maxtype", "slave_policy"];
+ 
+@@ -108,8 +108,8 @@ fn get_rtnl_links_values(name: &str, netdevice: &str) -> RtnlLinkValues {
+         "setup" => RtnlLinkValues::new("dev: *mut kernel::bindings::net_device", &setup_dev, "&mut dev"),
+         "validate" => RtnlLinkValues {
+             callback_params: "tb: *mut *mut kernel::bindings::nlattr, data: *mut *mut kernel::bindings::nlattr, extack: *mut kernel::bindings::netlink_ext_ack".to_owned(),
+-            return_type: "kernel::c_types::c_int".to_owned(),
+-            wrapper_before: r#"kernel::from_kernel_result! {
++            return_type: "core::ffi::c_int".to_owned(),
++            wrapper_before: r#"kernel::error::from_kernel_result! {
+                  let tb = kernel::net::netlink::NlAttrVec::from_pointer(tb as *const *const kernel::bindings::nlattr);
+                  let data = kernel::net::netlink::NlAttrVec::from_pointer(data as *const *const kernel::bindings::nlattr);
+                  let extack = kernel::net::netlink::NlExtAck::from_pointer(extack);
+-- 
+2.38.2
+

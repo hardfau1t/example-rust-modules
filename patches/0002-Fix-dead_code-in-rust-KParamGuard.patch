@@ -1,0 +1,25 @@
+From fa0d4a9e130d8d0b1120796acecfa3212f70f0d4 Mon Sep 17 00:00:00 2001
+From: Finn Behrens <me@kloenk.de>
+Date: Mon, 12 Jul 2021 19:50:47 +0200
+Subject: [PATCH 2/5] Fix dead_code in rust KParamGuard.
+
+Signed-off-by: Finn Behrens <me@kloenk.de>
+---
+ rust/kernel/lib.rs | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/rust/kernel/lib.rs b/rust/kernel/lib.rs
+index 0c83f174115c..8e3593c0245f 100644
+--- a/rust/kernel/lib.rs
++++ b/rust/kernel/lib.rs
+@@ -188,6 +188,7 @@ impl ThisModule {
+ /// Scoped lock on the kernel parameters of [`ThisModule`].
+ ///
+ /// Lock will be released when this struct is dropped.
++#[allow(dead_code)]
+ pub struct KParamGuard<'a> {
+     #[cfg(CONFIG_SYSFS)]
+     this_module: &'a ThisModule,
+-- 
+2.38.2
+

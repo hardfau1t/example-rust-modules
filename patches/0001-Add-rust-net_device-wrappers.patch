@@ -1,0 +1,2573 @@
+From 785f5ea711190069dc4c0e67b73e578729f9ec13 Mon Sep 17 00:00:00 2001
+From: Finn Behrens <me@kloenk.de>
+Date: Sat, 10 Jul 2021 12:37:27 +0200
+Subject: [PATCH 1/5] Add rust net_device wrappers
+
+Signed-off-by: Finn Behrens <me@kloenk.de>
+---
+ rust/bindings/bindings_helper.h |  15 +
+ rust/helpers.c                  |  42 +-
+ rust/kernel/error.rs            | 112 ++++-
+ rust/kernel/lib.rs              |  28 +-
+ rust/kernel/net/device/flags.rs | 277 +++++++++++
+ rust/kernel/net/device/mod.rs   | 794 ++++++++++++++++++++++++++++++++
+ rust/kernel/net/ethtool.rs      | 246 ++++++++++
+ rust/kernel/net/mod.rs          | 109 +++++
+ rust/kernel/net/netlink.rs      | 128 +++++
+ rust/kernel/net/rtnl.rs         | 149 ++++++
+ rust/kernel/net/skbuff.rs       | 149 ++++++
+ rust/kernel/types.rs            |  49 ++
+ rust/macros/helpers.rs          |  52 +++
+ rust/macros/lib.rs              |  59 +++
+ rust/macros/net.rs              | 144 ++++++
+ 15 files changed, 2338 insertions(+), 15 deletions(-)
+ create mode 100644 rust/kernel/net/device/flags.rs
+ create mode 100644 rust/kernel/net/device/mod.rs
+ create mode 100644 rust/kernel/net/ethtool.rs
+ create mode 100644 rust/kernel/net/mod.rs
+ create mode 100644 rust/kernel/net/netlink.rs
+ create mode 100644 rust/kernel/net/rtnl.rs
+ create mode 100644 rust/kernel/net/skbuff.rs
+ create mode 100644 rust/macros/net.rs
+
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+index 284793085d55..be82b1175b99 100644
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -36,7 +36,21 @@
+ #include <linux/sysctl.h>
+ #include <linux/uaccess.h>
+ #include <linux/uio.h>
++#include <linux/version.h>
++#include <linux/miscdevice.h>
++#include <linux/poll.h>
++#include <linux/mm.h>
++#include <linux/file.h>
+ #include <uapi/linux/android/binder.h>
++#include <linux/platform_device.h>
++#include <linux/of_platform.h>
++#include <linux/security.h>
++#include <linux/netdevice.h>
++#include <linux/ethtool.h>
++#include <linux/etherdevice.h>
++#include <linux/netdev_features.h>
++#include <linux/rtnetlink.h>
++#include <net/rtnetlink.h>
+ 
+ /* `bindgen` gets confused at certain things. */
+ const gfp_t BINDINGS_GFP_KERNEL = GFP_KERNEL;
+@@ -47,3 +61,4 @@ const __poll_t BINDINGS_EPOLLERR = EPOLLERR;
+ const __poll_t BINDINGS_EPOLLHUP = EPOLLHUP;
+ 
+ const loff_t BINDINGS_MAX_LFS_FILESIZE = MAX_LFS_FILESIZE;
++const int BINDINGS_NLA_HDRLEN = NLA_HDRLEN;
+diff --git a/rust/helpers.c b/rust/helpers.c
+index bf790f46c763..e57378bdb673 100644
+--- a/rust/helpers.c
++++ b/rust/helpers.c
+@@ -39,6 +39,9 @@
+ #include <linux/skbuff.h>
+ #include <linux/uaccess.h>
+ #include <linux/uio.h>
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <linux/rtnetlink.h>
+ 
+ __noreturn void rust_helper_BUG(void)
+ {
+@@ -655,12 +658,39 @@ int rust_helper_fs_parse(struct fs_context *fc,
+ }
+ EXPORT_SYMBOL_GPL(rust_helper_fs_parse);
+ 
+-/*
+- * We use `bindgen`'s `--size_t-is-usize` option to bind the C `size_t` type
+- * as the Rust `usize` type, so we can use it in contexts where Rust
+- * expects a `usize` like slice (array) indices. `usize` is defined to be
+- * the same as C's `uintptr_t` type (can hold any pointer) but not
+- * necessarily the same as `size_t` (can hold the size of any single
++void *rust_helper_netdev_priv(struct net_device *dev)
++{
++	return netdev_priv(dev);
++}
++EXPORT_SYMBOL_GPL(rust_helper_netdev_priv);
++
++void rust_helper_eth_hw_addr_random(struct net_device *dev)
++{
++	eth_hw_addr_random(dev);
++}
++EXPORT_SYMBOL_GPL(rust_helper_eth_hw_addr_random);
++
++int rust_helper_net_device_set_new_lstats(struct net_device *dev)
++{
++	dev->lstats = netdev_alloc_pcpu_stats(struct pcpu_lstats);
++	if (!dev->lstats)
++		return -ENOMEM;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(rust_helper_net_device_set_new_lstats);
++
++void rust_helper_dev_lstats_add(struct net_device *dev, unsigned int len)
++{
++	dev_lstats_add(dev, len);
++}
++EXPORT_SYMBOL_GPL(rust_helper_dev_lstats_add);
++
++/* We use bindgen's --size_t-is-usize option to bind the C size_t type
++ * as the Rust usize type, so we can use it in contexts where Rust
++ * expects a usize like slice (array) indices. usize is defined to be
++ * the same as C's uintptr_t type (can hold any pointer) but not
++ * necessarily the same as size_t (can hold the size of any single
+  * object). Most modern platforms use the same concrete integer type for
+  * both of them, but in case we find ourselves on a platform where
+  * that's not true, fail early instead of risking ABI or
+diff --git a/rust/kernel/error.rs b/rust/kernel/error.rs
+index f968aa91ddf2..18c74055b9c9 100644
+--- a/rust/kernel/error.rs
++++ b/rust/kernel/error.rs
+@@ -320,6 +320,116 @@ pub mod code {
+ pub struct Error(core::ffi::c_int);
+ 
+ impl Error {
++    /*DEBUG_CONFLICT
++    /// Operation not permitted.
++    pub const EPERM: Self = Error(-(bindings::EPERM as i32));
++
++    /// No such file or directory.
++    pub const ENOENT: Self = Error(-(bindings::ENOENT as i32));
++
++    /// No such process.
++    pub const ESRCH: Self = Error(-(bindings::ESRCH as i32));
++
++    /// Interrupted system call.
++    pub const EINTR: Self = Error(-(bindings::EINTR as i32));
++
++    /// I/O error.
++    pub const EIO: Self = Error(-(bindings::EIO as i32));
++
++    /// No such device or address.
++    pub const ENXIO: Self = Error(-(bindings::ENXIO as i32));
++
++    /// Argument list too long.
++    pub const E2BIG: Self = Error(-(bindings::E2BIG as i32));
++
++    /// Exec format error.
++    pub const ENOEXEC: Self = Error(-(bindings::ENOEXEC as i32));
++
++    /// Bad file number.
++    pub const EBADF: Self = Error(-(bindings::EBADF as i32));
++
++    /// No child processes.
++    pub const ECHILD: Self = Error(-(bindings::ECHILD as i32));
++
++    /// Try again.
++    pub const EAGAIN: Self = Error(-(bindings::EAGAIN as i32));
++
++    /// Out of memory.
++    pub const ENOMEM: Self = Error(-(bindings::ENOMEM as i32));
++
++    /// Permission denied.
++    pub const EACCES: Self = Error(-(bindings::EACCES as i32));
++
++    /// Bad address.
++    pub const EFAULT: Self = Error(-(bindings::EFAULT as i32));
++
++    /// Block device required.
++    pub const ENOTBLK: Self = Error(-(bindings::ENOTBLK as i32));
++
++    /// Device or resource busy.
++    pub const EBUSY: Self = Error(-(bindings::EBUSY as i32));
++
++    /// File exists.
++    pub const EEXIST: Self = Error(-(bindings::EEXIST as i32));
++
++    /// Cross-device link.
++    pub const EXDEV: Self = Error(-(bindings::EXDEV as i32));
++
++    /// No such device.
++    pub const ENODEV: Self = Error(-(bindings::ENODEV as i32));
++
++    /// Not a directory.
++    pub const ENOTDIR: Self = Error(-(bindings::ENOTDIR as i32));
++
++    /// Is a directory.
++    pub const EISDIR: Self = Error(-(bindings::EISDIR as i32));
++
++    /// Invalid argument.
++    pub const EINVAL: Self = Error(-(bindings::EINVAL as i32));
++
++    /// File table overflow.
++    pub const ENFILE: Self = Error(-(bindings::ENFILE as i32));
++
++    /// Too many open files.
++    pub const EMFILE: Self = Error(-(bindings::EMFILE as i32));
++
++    /// Not a typewriter.
++    pub const ENOTTY: Self = Error(-(bindings::ENOTTY as i32));
++
++    /// Text file busy.
++    pub const ETXTBSY: Self = Error(-(bindings::ETXTBSY as i32));
++
++    /// File too large.
++    pub const EFBIG: Self = Error(-(bindings::EFBIG as i32));
++
++    /// No space left on device.
++    pub const ENOSPC: Self = Error(-(bindings::ENOSPC as i32));
++
++    /// Illegal seek.
++    pub const ESPIPE: Self = Error(-(bindings::ESPIPE as i32));
++
++    /// Read-only file system.
++    pub const EROFS: Self = Error(-(bindings::EROFS as i32));
++
++    /// Too many links.
++    pub const EMLINK: Self = Error(-(bindings::EMLINK as i32));
++
++    /// Broken pipe.
++    pub const EPIPE: Self = Error(-(bindings::EPIPE as i32));
++
++    /// Math argument out of domain of func.
++    pub const EDOM: Self = Error(-(bindings::EDOM as i32));
++
++    /// Math result not representable.
++    pub const ERANGE: Self = Error(-(bindings::ERANGE as i32));
++
++    /// Cannot assign requested address
++    pub const EADDRNOTAVAIL: Self = Error(-(bindings::EADDRNOTAVAIL as i32));
++
++    /// Restart the system call.
++    pub const ERESTARTSYS: Self = Error(-(bindings::ERESTARTSYS as i32));
++
++    */
+     /// Creates an [`Error`] from a kernel error code.
+     ///
+     /// It is a bug to pass an out-of-range `errno`. `EINVAL` would
+@@ -497,7 +607,7 @@ where
+ /// ```
+ macro_rules! from_kernel_result {
+     ($($tt:tt)*) => {{
+-        $crate::error::from_kernel_result_helper((|| {
++        $crate::from_kernel_result_helper((|| {
+             $($tt)*
+         })())
+     }};
+diff --git a/rust/kernel/lib.rs b/rust/kernel/lib.rs
+index 6a322effa60c..0c83f174115c 100644
+--- a/rust/kernel/lib.rs
++++ b/rust/kernel/lib.rs
+@@ -12,22 +12,32 @@
+ //! do so first instead of bypassing this crate.
+ 
+ #![no_std]
+-#![feature(allocator_api)]
+-#![feature(associated_type_defaults)]
++/* DEBUG_CONFLICT
+ #![feature(coerce_unsized)]
+-#![feature(const_mut_refs)]
+ #![feature(const_ptr_offset_from)]
+ #![feature(const_refs_to_cell)]
+ #![feature(const_trait_impl)]
+ #![feature(core_ffi_c)]
+ #![feature(c_size_t)]
+ #![feature(dispatch_from_dyn)]
+-#![feature(doc_cfg)]
+ #![feature(duration_constants)]
+ #![feature(generic_associated_types)]
+ #![feature(ptr_metadata)]
+-#![feature(receiver_trait)]
+ #![feature(unsize)]
++*/
++#![feature(
++    allocator_api,
++    alloc_error_handler,
++    associated_type_defaults,
++    const_fn_trait_bound,
++    const_mut_refs,
++    const_panic,
++    const_raw_ptr_deref,
++    const_unreachable_unchecked,
++    receiver_trait,
++    try_reserve,
++    doc_cfg
++)]
+ 
+ // Ensure conditional compilation based on the kernel configuration works;
+ // otherwise we may silently break things like initcall handling.
+@@ -61,7 +71,9 @@ pub mod irq;
+ pub mod kasync;
+ pub mod miscdev;
+ pub mod mm;
+-#[cfg(CONFIG_NET)]
++
++#[cfg(any(CONFIG_NET, doc))]
++#[doc(cfg(CONFIG_NET))]
+ pub mod net;
+ pub mod pages;
+ pub mod power;
+@@ -107,10 +119,10 @@ pub mod kunit;
+ #[doc(hidden)]
+ pub use build_error::build_error;
+ 
+-pub use crate::error::{to_result, Error, Result};
++pub use crate::error::{to_result, Error, Result, from_kernel_result_helper};
+ pub use crate::types::{
+     bit, bits_iter, ARef, AlwaysRefCounted, Bit, Bool, Either, Either::Left, Either::Right, False,
+-    Mode, Opaque, PointerWrapper, ScopeGuard, True,
++    Mode, SavedAsPointer, SavedAsPointerMut, Opaque, PointerWrapper, ScopeGuard, True,
+ };
+ 
+ use core::marker::PhantomData;
+diff --git a/rust/kernel/net/device/flags.rs b/rust/kernel/net/device/flags.rs
+new file mode 100644
+index 000000000000..fc4495d2c926
+--- /dev/null
++++ b/rust/kernel/net/device/flags.rs
+@@ -0,0 +1,277 @@
++use crate::{bindings, Error};
++use core::convert::{From, TryFrom};
++use core::ops::{Add, AddAssign, Sub, SubAssign};
++
++/// Holds multiple flags to give to an interface via [`super::NetDevice::add_flag`].
++#[repr(transparent)]
++#[derive(Debug, Clone, Copy)]
++pub struct Features(u64);
++
++impl Features {
++    /// Create new Flag with value `0`.
++    #[inline]
++    pub const fn empty() -> Self {
++        Self(0)
++    }
++
++    /// Add flag to Self.
++    #[inline]
++    pub fn insert(&mut self, flag: u64) {
++        self.0 |= flag;
++    }
++
++    /// Remove the given flag from Self.
++    #[inline]
++    pub fn remove(&mut self, flag: u64) {
++        self.0 &= !(flag);
++    }
++}
++
++impl Add for Features {
++    type Output = Self;
++
++    #[inline]
++    #[allow(clippy::suspicious_arithmetic_impl)]
++    fn add(self, rhs: Self) -> Self::Output {
++        Self(self.0 | rhs.0)
++    }
++}
++
++impl Add<u64> for Features {
++    type Output = Self;
++
++    #[inline]
++    #[allow(clippy::suspicious_arithmetic_impl)]
++    fn add(self, rhs: u64) -> Self::Output {
++        Self(self.0 | rhs)
++    }
++}
++
++impl Sub for Features {
++    type Output = Self;
++
++    #[inline]
++    #[allow(clippy::suspicious_arithmetic_impl)]
++    fn sub(self, rhs: Self) -> Self::Output {
++        Self(self.0 & !rhs.0)
++    }
++}
++
++impl Sub<u64> for Features {
++    type Output = Self;
++
++    #[inline]
++    #[allow(clippy::suspicious_arithmetic_impl)]
++    fn sub(self, rhs: u64) -> Self::Output {
++        Self(self.0 & !rhs)
++    }
++}
++
++impl AddAssign for Features {
++    #[inline]
++    #[allow(clippy::suspicious_op_assign_impl)]
++    fn add_assign(&mut self, rhs: Self) {
++        self.0 |= rhs.0
++    }
++}
++
++impl AddAssign<u64> for Features {
++    #[inline]
++    #[allow(clippy::suspicious_op_assign_impl)]
++    fn add_assign(&mut self, rhs: u64) {
++        self.0 |= rhs
++    }
++}
++
++impl SubAssign for Features {
++    #[inline]
++    #[allow(clippy::suspicious_op_assign_impl)]
++    fn sub_assign(&mut self, rhs: Self) {
++        self.0 &= !rhs.0
++    }
++}
++
++impl SubAssign<u64> for Features {
++    #[inline]
++    #[allow(clippy::suspicious_op_assign_impl)]
++    fn sub_assign(&mut self, rhs: u64) {
++        self.0 &= !rhs
++    }
++}
++
++impl TryFrom<u64> for Features {
++    type Error = Error;
++
++    #[inline]
++    fn try_from(flags: u64) -> Result<Self, Self::Error> {
++        Ok(Self(flags))
++    }
++}
++
++impl From<Features> for u64 {
++    #[inline]
++    fn from(flag: Features) -> Self {
++        flag.0
++    }
++}
++
++macro_rules! _netif_f {
++    ($name:ident, $binding:ident) => {
++        #[doc = concat!("[`Features`] flag for `", stringify!($binding), "`")]
++        pub const $name: Features = Features(1u64 << $crate::bindings::$binding);
++    };
++}
++
++macro_rules! _netif_f_sum {
++        ($name:ident, $($f:ident),+) => {
++            #[doc = concat!("[`Features`] flag for `NETIF_F_", stringify!($name), "`")]
++            pub const $name: Features = Features($(Features::$f.0)|*);
++        };
++    }
++
++impl Features {
++    _netif_f!(SG, NETIF_F_SG_BIT);
++    _netif_f!(FRAGLIST, NETIF_F_FRAGLIST_BIT);
++    _netif_f!(TSO, NETIF_F_TSO_BIT);
++    _netif_f!(TSO6, NETIF_F_TSO6_BIT);
++    _netif_f!(TSO_ECN, NETIF_F_TSO_ECN_BIT);
++    _netif_f!(TSO_MANGLEID, NETIF_F_TSO_MANGLEID_BIT);
++    _netif_f!(GSO_SCTP, NETIF_F_GSO_SCTP_BIT);
++    _netif_f!(GSO_UDP_L4, NETIF_F_GSO_UDP_L4_BIT);
++    _netif_f!(GSO_FRAGLIST, NETIF_F_GSO_FRAGLIST_BIT);
++    _netif_f!(HW_CSUM, NETIF_F_HW_CSUM_BIT);
++    _netif_f!(HIGHDMA, NETIF_F_HIGHDMA_BIT);
++    _netif_f!(LLTX, NETIF_F_LLTX_BIT);
++    _netif_f!(GSO_GRE, NETIF_F_GSO_GRE_BIT);
++    _netif_f!(GSO_GRE_CSUM, NETIF_F_GSO_GRE_CSUM_BIT);
++    _netif_f!(GSO_IPXIP4, NETIF_F_GSO_IPXIP4_BIT);
++    _netif_f!(GSO_IPXIP6, NETIF_F_GSO_IPXIP6_BIT);
++    _netif_f!(GSO_UDP_TUNNEL, NETIF_F_GSO_UDP_TUNNEL_BIT);
++    _netif_f!(GSO_UDP_TUNNEL_CSUM, NETIF_F_GSO_UDP_TUNNEL_CSUM_BIT);
++
++    _netif_f_sum!(ALL_TSO, TSO, TSO6, TSO_ECN, TSO_MANGLEID);
++    _netif_f_sum!(GSO_SOFTWARE, ALL_TSO, GSO_SCTP, GSO_UDP_L4, GSO_FRAGLIST);
++    _netif_f_sum!(
++        GSO_ENCAP_ALL,
++        GSO_GRE,
++        GSO_GRE_CSUM,
++        GSO_IPXIP4,
++        GSO_IPXIP6,
++        GSO_UDP_TUNNEL,
++        GSO_UDP_TUNNEL_CSUM
++    );
++}
++
++/// Iff flags
++#[repr(u32)]
++#[allow(non_camel_case_types)]
++pub enum Flag {
++    /// UP
++    UP = bindings::net_device_flags_IFF_UP,
++    /// BROADCAST
++    BROADCAST = bindings::net_device_flags_IFF_BROADCAST,
++    /// DEBUG
++    DEBUG = bindings::net_device_flags_IFF_DEBUG,
++    /// LOOPBACK
++    LOOPBACK = bindings::net_device_flags_IFF_LOOPBACK,
++    /// POINTOPOINT
++    POINTOPOINT = bindings::net_device_flags_IFF_POINTOPOINT,
++    /// NOTRAILERS
++    NOTRAILERS = bindings::net_device_flags_IFF_NOTRAILERS,
++    /// RUNNING
++    RUNNING = bindings::net_device_flags_IFF_RUNNING,
++    /// NOARP
++    NOARP = bindings::net_device_flags_IFF_NOARP,
++    /// PROMISC
++    PROMISC = bindings::net_device_flags_IFF_PROMISC,
++    /// ALLMULTI
++    ALLMULTI = bindings::net_device_flags_IFF_ALLMULTI,
++    /// MASTER
++    MASTER = bindings::net_device_flags_IFF_MASTER,
++    /// SLAVE
++    SLAVE = bindings::net_device_flags_IFF_SLAVE,
++    /// MULTICAST
++    MULTICAST = bindings::net_device_flags_IFF_MULTICAST,
++    /// PORTSEL
++    PORTSEL = bindings::net_device_flags_IFF_PORTSEL,
++    /// AUTOMEDIA
++    AUTOMEDIA = bindings::net_device_flags_IFF_AUTOMEDIA,
++    /// DYNAMIC
++    DYNAMIC = bindings::net_device_flags_IFF_DYNAMIC,
++
++    // #if __UAPI_DEF_IF_NET_DEVICE_FLAGS_LOWER_UP_DORMANT_ECHO // TODO: is this needed?
++    /// LOWER
++    LOWER = bindings::net_device_flags_IFF_LOWER_UP,
++    /// DORMANT
++    DORMANT = bindings::net_device_flags_IFF_DORMANT,
++    /// ECHO
++    ECHO = bindings::net_device_flags_IFF_ECHO,
++}
++
++/// Iff private flags
++#[repr(i32)]
++#[allow(non_camel_case_types)]
++pub enum PrivFlag {
++    /// 802.1Q VLAN device.
++    IFF_802_1Q_VLAN = bindings::netdev_priv_flags_IFF_802_1Q_VLAN, /* TODO: find a good name without leading 8 */
++    /// Ethernet bridging device.
++    EBRIDGE = bindings::netdev_priv_flags_IFF_EBRIDGE,
++    /// Bonding master or slave.
++    BONDING = bindings::netdev_priv_flags_IFF_BONDING,
++    /// ISATAP interface (RFC4214).
++    ISATAP = bindings::netdev_priv_flags_IFF_ISATAP,
++    /// WAN HDLC device.
++    WAN_HDLC = bindings::netdev_priv_flags_IFF_WAN_HDLC,
++    /// dev_hard_start_xmit() is allowed to release skb->dst
++    XMIT_DST_RELEASE = bindings::netdev_priv_flags_IFF_XMIT_DST_RELEASE,
++    /// Disallow bridging this ether dev.
++    DONT_BRIDGE = bindings::netdev_priv_flags_IFF_DONT_BRIDGE,
++    /// Disable netpoll at run-time.
++    DISABLE_NETPOLL = bindings::netdev_priv_flags_IFF_DISABLE_NETPOLL,
++    /// Device used as macvlan port.
++    MACVLAN_PORT = bindings::netdev_priv_flags_IFF_MACVLAN_PORT,
++    /// Device used as bridge port.
++    BRIDGE_PORT = bindings::netdev_priv_flags_IFF_BRIDGE_PORT,
++    /// Device used as Open vSwitch datapath port.
++    OVS_DATAPATH = bindings::netdev_priv_flags_IFF_OVS_DATAPATH,
++    /// The interface supports sharing skbs on transmit.
++    TX_SKB_SHARING = bindings::netdev_priv_flags_IFF_TX_SKB_SHARING,
++    /// Supports unicast filtering.
++    UNICAST_FLT = bindings::netdev_priv_flags_IFF_UNICAST_FLT,
++    /// Device used as team port.
++    TEAM_PORT = bindings::netdev_priv_flags_IFF_TEAM_PORT,
++    /// Device supports sending custom FCS.
++    SUPP_NOFCS = bindings::netdev_priv_flags_IFF_SUPP_NOFCS,
++    /// Device supports hardware address change when it's running.
++    LIVE_ADDR_CHANGE = bindings::netdev_priv_flags_IFF_LIVE_ADDR_CHANGE,
++    /// Macvlan device.
++    MACVLAN = bindings::netdev_priv_flags_IFF_MACVLAN,
++    /// IFF_XMIT_DST_RELEASE not taking into account underlying stacked devices.
++    XMIT_DST_RELEASE_PERM = bindings::netdev_priv_flags_IFF_XMIT_DST_RELEASE_PERM,
++    /// Device is an L3 master device.
++    L3MDEV_MASTER = bindings::netdev_priv_flags_IFF_L3MDEV_MASTER,
++    /// Device can run without qdisc attached.
++    NO_QUEUE = bindings::netdev_priv_flags_IFF_NO_QUEUE,
++    /// Device is a Open vSwitch master.
++    OPENVSWITCH = bindings::netdev_priv_flags_IFF_OPENVSWITCH,
++    /// Device is enslaved to an L3 master device.
++    L3MDEV_SLAVE = bindings::netdev_priv_flags_IFF_L3MDEV_SLAVE,
++    /// Device is a team device.
++    TEAM = bindings::netdev_priv_flags_IFF_TEAM,
++    /// Device has had Rx Flow indirection table configured.
++    RXFH_CONFIGURED = bindings::netdev_priv_flags_IFF_RXFH_CONFIGURED,
++    /// The headroom value is controlled by an external entity (i.e. the master device for bridged veth).
++    PHONY_HEADROOM = bindings::netdev_priv_flags_IFF_PHONY_HEADROOM,
++    /// Device is a MACsec device.
++    MACSEC = bindings::netdev_priv_flags_IFF_MACSEC,
++    /// Device doesn't support the rx_handler hook.
++    NO_RX_HANDLER = bindings::netdev_priv_flags_IFF_NO_RX_HANDLER,
++    /// Device is a failover master device.
++    FAILOVER = bindings::netdev_priv_flags_IFF_FAILOVER,
++    /// Device is lower dev of a failover master device.
++    FAILOVER_SLAVE = bindings::netdev_priv_flags_IFF_FAILOVER_SLAVE,
++    /// Only invoke the rx handler of L3 master device.
++    L3MDEV_RX_HANDLER = bindings::netdev_priv_flags_IFF_L3MDEV_RX_HANDLER,
++    /// Rename is allowed while device is up and running.
++    LIVE_RENAME_OK = bindings::netdev_priv_flags_IFF_LIVE_RENAME_OK,
++}
+diff --git a/rust/kernel/net/device/mod.rs b/rust/kernel/net/device/mod.rs
+new file mode 100644
+index 000000000000..de92c1524b72
+--- /dev/null
++++ b/rust/kernel/net/device/mod.rs
+@@ -0,0 +1,794 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! Net Device Operations.
++//!
++
++/// Flags.
++mod flags;
++
++#[doc(inline)]
++pub use flags::{Features, Flag, PrivFlag};
++
++use core::{marker, mem, ptr};
++
++use crate::bindings;
++use crate::error::{Error, Result};
++use crate::from_kernel_result;
++use crate::types::{SavedAsPointer, SavedAsPointerMut};
++use crate::{c_types, str::CStr};
++
++use super::ethtool::EthToolOps;
++use super::rtnl::{RtnlLinkStats64, RtnlLock};
++use super::skbuff::SkBuff;
++use core::convert::TryFrom;
++
++extern "C" {
++    #[allow(improper_ctypes)]
++    fn rust_helper_netdev_priv(dev: *const bindings::net_device) -> *mut c_types::c_void;
++
++    #[allow(improper_ctypes)]
++    fn rust_helper_eth_hw_addr_random(dev: *const bindings::net_device);
++
++    #[allow(improper_ctypes)]
++    fn rust_helper_net_device_set_new_lstats(dev: *mut bindings::net_device) -> c_types::c_int;
++
++    #[allow(improper_ctypes)]
++    fn rust_helper_dev_lstats_add(dev: *mut bindings::net_device, len: u32);
++}
++
++/// interface name assignment types (sysfs name_assign_type attribute).
++#[repr(u8)]
++pub enum NetNameAssingType {
++    /// Unknown network name assing type.
++    Unknown = bindings::NET_NAME_UNKNOWN as u8,
++    /// Enum network name assing type.
++    Enum = bindings::NET_NAME_ENUM as u8,
++}
++
++unsafe extern "C" fn setup_netdev_callback<T: NetDeviceAdapter>(dev: *mut bindings::net_device) {
++    let mut dev = unsafe { NetDevice::<T>::from_pointer(dev) };
++
++    T::setup(&mut dev);
++}
++
++/// Wraps the kernel's `struct net_device`.
++///
++/// # Invariants
++///
++/// The pointer `Self::ptr` is non-null and valid.
++#[repr(transparent)]
++pub struct NetDevice<T: NetDeviceAdapter> {
++    ptr: *mut bindings::net_device,
++    priv_data: marker::PhantomData<T>,
++}
++
++impl<T: NetDeviceAdapter> NetDevice<T> {
++    /// Allocate and create a new NetDevice with private data T.
++    /// This function locks [`RtnlLock`].
++    pub fn new(
++        priv_data: T,
++        format_name: &CStr,
++        name_assign_type: NetNameAssingType,
++        txqs: u32,
++        rxqs: u32,
++    ) -> Result<Self> {
++        let lock = RtnlLock::lock();
++        // SAFETY: Lock is hold.
++        let dev = unsafe { Self::new_locked(priv_data, format_name, name_assign_type, txqs, rxqs) };
++
++        // make sure lock is hold until here
++        drop(lock);
++        dev
++    }
++
++    /// Allocate and create a new NetDevice with private data T.
++    /// No lock is acquired by this function, therefore this function is unsafe.
++    ///
++    /// # Safety
++    ///
++    /// The caller has to hold the [`RtnlLock`].
++    pub unsafe fn new_locked(
++        priv_data: T,
++        format_name: &CStr,
++        name_assign_type: NetNameAssingType,
++        txqs: u32,
++        rxqs: u32,
++    ) -> Result<Self> {
++        if txqs < 1 || rxqs < 1 {
++            return Err(Error::EINVAL);
++        }
++        let size = mem::size_of::<T>() as i32;
++
++        let ptr = unsafe {
++            bindings::alloc_netdev_mqs(
++                size,
++                format_name.as_ptr() as _,
++                name_assign_type as u8,
++                Some(setup_netdev_callback::<T>),
++                txqs,
++                rxqs,
++            )
++        };
++        if ptr.is_null() {
++            return Err(Error::ENOMEM);
++        }
++
++        if size != 0 {
++            unsafe {
++                let dest = rust_helper_netdev_priv(ptr) as *mut T;
++                ptr::write(dest, priv_data);
++            }
++        }
++
++        Ok(Self {
++            ptr,
++            priv_data: marker::PhantomData::<T>,
++        })
++    }
++
++    /// Return a reference to the private data of the [`NetDevice`].
++    pub fn get_priv_data(&self) -> &T {
++        // SAFETY: self.ptr is valid if self is valid.
++        let priv_ptr = unsafe { rust_helper_netdev_priv(self.ptr) } as *mut T;
++
++        // SAFETY: ptr is valid and of type T if self is valid.
++        unsafe { priv_ptr.as_ref() }.unwrap()
++    }
++
++    /// Return a mutable reference of the private data of the [`NetDevice`]
++    pub fn get_priv_data_mut(&mut self) -> &mut T {
++        // SAFETY: self.ptr is valid if self is valid.
++        let priv_ptr = unsafe { rust_helper_netdev_priv(self.ptr) as *mut T };
++
++        // SAFETY: ptr is valid and of type T if self is valid.
++        unsafe { priv_ptr.as_mut().unwrap() }
++    }
++
++    /// Setup Ethernet network device.
++    ///
++    /// Fill in the fields of the device structure with Ethernet-generic values.
++    pub fn ether_setup(&mut self) {
++        // SAFETY: self.ptr is valid if self is valid.
++        unsafe { bindings::ether_setup(self.ptr as *mut bindings::net_device) }
++    }
++
++    /// Generate software assigned random Ethernet and set device flag.
++    ///
++    /// Generate a random Ethernet address (MAC) to be used by a net device
++    /// and set addr_assign_type so the state can be read by sysfs and be
++    /// used by userspace.
++    pub fn hw_addr_random(&mut self) {
++        // SAFETY: self.ptr is valid if self is valid.
++        unsafe { rust_helper_eth_hw_addr_random(self.ptr) };
++    }
++
++    /// Register a network device.
++    ///
++    /// Take a completed network device structure and add it to the kernel
++    /// interfaces. A %NETDEV_REGISTER message is sent to the netdev notifier
++    /// chain.
++    ///
++    /// This is a wrapper around register_netdevice that takes the rtnl semaphore
++    /// and expands the device name if you passed a format string to
++    /// alloc_netdev.
++    pub fn register(&self) -> Result {
++        // SAFETY: self.ptr is valid if self is valid.
++        // FIXME: where is the lock hold?
++        let err = unsafe { bindings::register_netdev(self.ptr) };
++
++        if err != 0 {
++            Err(Error::from_kernel_errno(err))
++        } else {
++            Ok(())
++        }
++    }
++
++    /// Register a network device if the RtnlLock is already hold.
++    ///
++    /// Take a completed network device structure and add it to the kernel
++    /// interfaces. A %NETDEV_REGISTER message is sent to the netdev notifier
++    /// chain. 0 is returned on success. A negative errno code is returned
++    /// on a failure to set up the device, or if the name is a duplicate.
++    ///
++    /// Callers must hold the rtnl semaphore. You may want
++    /// [`Self::register`] instead of this.
++    ///
++    /// BUGS:
++    /// The locking appears insufficient to guarantee two parallel registers
++    /// will not get the same name.
++    ///
++    /// # Safety
++    ///
++    /// caller must hold the [`RtnlLock`] and semaphore
++    pub unsafe fn register_locked(&self) -> Result {
++        let err = unsafe { bindings::register_netdevice(self.ptr) };
++
++        if err != 0 {
++            Err(Error::from_kernel_errno(err))
++        } else {
++            Ok(())
++        }
++    }
++
++    /// Set the rtnl_link_ops to a network interface.
++    ///
++    /// Takes a static mut created with [`crate::net::rtnl_link_ops!`] and assing it to [`self`].
++    pub fn set_rtnl_ops(&mut self, ops: &'static super::rtnl::RtnlLinkOps) {
++        // get rtnl_lock
++        let lock = RtnlLock::lock();
++
++        // SAFETY: lock is hold
++        unsafe { self.set_rtnl_ops_locked(ops) }
++
++        // make sure lock is still valid
++        drop(lock);
++    }
++
++    /// Set the rtnl_link_ops to a network interface, while the caller holds the [`RtnlLock`].
++    ///
++    /// Takes a static mut created with [`crate::net::rtnl_link_ops!`] and assing it to self.
++    ///
++    /// # Safety
++    ///
++    /// The caller has to hold the [`RtnlLock`].
++    pub unsafe fn set_rtnl_ops_locked(&mut self, ops: &'static super::rtnl::RtnlLinkOps) {
++        let mut dev = self.get_internal_mut();
++
++        dev.rtnl_link_ops = ops.as_ptr() as *mut bindings::rtnl_link_ops;
++    }
++
++    /// Add a [`Flag`] flag to the [`NetDevice`].
++    pub fn add_flag(&mut self, flag: Flag) {
++        let mut dev = self.get_internal_mut();
++
++        dev.flags |= flag as u32;
++    }
++
++    /// Remove a [`Flag`] flag from the [`NetDevice`].
++    pub fn remove_flag(&mut self, flag: Flag) {
++        let mut dev = self.get_internal_mut();
++
++        dev.flags &= !(flag as u32);
++    }
++
++    /// Add a [`PrivFlag`] private_flag to the [`NetDevice`].
++    pub fn add_private_flag(&mut self, flag: PrivFlag) {
++        let mut dev = self.get_internal_mut();
++
++        dev.priv_flags |= flag as u32;
++    }
++
++    /// Remove a [`PrivFlag`] private_flag from the [`NetDevice`].
++    pub fn remove_private_flag(&mut self, flag: PrivFlag) {
++        let mut dev = self.get_internal_mut();
++
++        dev.priv_flags &= !(flag as u32);
++    }
++
++    /// Set a [`Features`] `feature` set to the [`NetDevice`].
++    pub fn set_features(&mut self, features: Features) {
++        let mut dev = self.get_internal_mut();
++
++        dev.features = features.into();
++    }
++
++    /// Get the [`Features`] `feature` set from the [`NetDevice`].
++    pub fn get_features(&self) -> Result<Features> {
++        let dev = self.get_internal();
++
++        Features::try_from(dev.features)
++    }
++
++    /// Set a [`Features`] `hw_feature` set to the [`NetDevice`].
++    pub fn set_hw_features(&mut self, features: Features) {
++        let mut dev = self.get_internal_mut();
++
++        dev.hw_features = features.into();
++    }
++
++    /// Get the [`Features`] `hw_feature` set from the [`NetDevice`].
++    pub fn get_hw_features(&self) -> Result<Features> {
++        let dev = self.get_internal();
++
++        Features::try_from(dev.hw_features)
++    }
++
++    /// Set a [`Features`] `hw_enc_feature` set to the [`NetDevice`].
++    pub fn set_hw_enc_features(&mut self, features: Features) {
++        let mut dev = self.get_internal_mut();
++
++        dev.hw_enc_features = features.into();
++    }
++
++    /// Get the [`Features`] `hw_enc_feature` set from the [`NetDevice`].
++    pub fn get_hw_enc_features(&self) -> Result<Features> {
++        let dev = self.get_internal();
++
++        Features::try_from(dev.hw_enc_features)
++    }
++
++    /// Set mut for the [`NetDevice`].
++    pub fn set_mtu(&mut self, min: u32, max: u32) {
++        let mut dev = self.get_internal_mut();
++
++        dev.min_mtu = min;
++        dev.max_mtu = max;
++    }
++
++    /// Create a new `pcpu_lstats` struct and assing it to the [`NetDevice`].
++    // This is more or less a workaround, as I did not find a way to create a pcpu marco
++    // and assing some value to the anonymous union.
++    pub fn set_new_pcpu_lstats(&mut self) -> Result {
++        // SAFETY: calling c function
++        let ret = unsafe { rust_helper_net_device_set_new_lstats(self.ptr) };
++
++        if ret != 0 {
++            Err(Error::from_kernel_errno(ret))
++        } else {
++            Ok(())
++        }
++    }
++
++    /// Free the lstats field.
++    /// # Safety
++    ///
++    /// Only call when the same device had set_new_pcpu_lstats called
++    pub unsafe fn free_lstats(&mut self) {
++        let net_device: &bindings::net_device = self.get_internal();
++
++        unsafe {
++            // SAFETY: self.ptr->lstats is valid if self is valid
++            let lstats = net_device.__bindgen_anon_1.lstats;
++            // SAFETY: calling C function
++            if !lstats.is_null() {
++                bindings::free_percpu(lstats as *mut _)
++            }
++        }
++    }
++
++    /// Add a value the the internal lstats.
++    pub fn lstats_add(&mut self, len: u32) {
++        // SAFETY: calling c function
++        unsafe {
++            rust_helper_dev_lstats_add(self.ptr as *mut bindings::net_device, len);
++        }
++    }
++
++    /// Set carrier.
++    pub fn carrier_set(&mut self, status: bool) {
++        // SAFETY: self.ptr is valid if self is valid.
++        if status {
++            unsafe { bindings::netif_carrier_on(self.ptr as *mut bindings::net_device) }
++        } else {
++            unsafe { bindings::netif_carrier_off(self.ptr as *mut bindings::net_device) }
++        }
++    }
++
++    /// Set `netdev_ops` and `ethtool_ops` from the [`NetDeviceAdapter`] T to the [`NetDevice`].
++    /// This also sets `needs_free_netdev` to true.
++    pub fn set_ops(&mut self) {
++        let internal = self.get_internal_mut();
++        internal.needs_free_netdev = true;
++        // SAFETY: T is valid for this netdevice, so build is valid.
++        unsafe {
++            internal.netdev_ops = NetDeviceOperationsVtable::<T>::build();
++            internal.ethtool_ops = super::ethtool::EthToolOperationsVtable::<T>::build();
++        }
++    }
++}
++
++unsafe impl<T: NetDeviceAdapter> Sync for NetDevice<T> {}
++
++impl<I: NetDeviceAdapter> SavedAsPointer for NetDevice<I> {
++    type InternalType = bindings::net_device;
++
++    fn get_pointer(&self) -> *const Self::InternalType {
++        self.ptr as *const Self::InternalType
++    }
++
++    unsafe fn from_pointer(ptr: *const Self::InternalType) -> Self {
++        Self {
++            ptr: ptr as *mut Self::InternalType,
++            priv_data: marker::PhantomData::<I>,
++        }
++    }
++}
++
++impl<I: NetDeviceAdapter> SavedAsPointerMut for NetDevice<I> {
++    fn get_pointer_mut(&mut self) -> *mut Self::InternalType {
++        self.ptr
++    }
++
++    unsafe fn from_pointer_mut(ptr: *mut Self::InternalType) -> Self {
++        Self {
++            ptr,
++            priv_data: marker::PhantomData::<I>,
++        }
++    }
++}
++
++/// Trait holding the type of the NetDevice, and implementing the setup function.
++pub trait NetDeviceAdapter: Sized {
++    /// Type of the Inner Private data field
++    type Inner: Sized; // = Self
++
++    /// Type ipmlementing all functions used for [`NetDeviceOps`].
++    type Ops: NetDeviceOps<Self>;
++
++    /// Type implementing all functions used for [`EthToolOps`].
++    type EthOps: EthToolOps<Self>;
++
++    /// Callback to initialize the device
++    /// Function tables have to be assinged via [`NetDevice::set_ops`]
++    fn setup(dev: &mut NetDevice<Self>);
++}
++
++#[repr(i32)]
++#[allow(non_camel_case_types)]
++/// Maps to [`bindings::netdev_tx`] from the kernel.
++pub enum NetdevTX {
++    /// TX_OK
++    TX_OK = bindings::netdev_tx_NETDEV_TX_OK,
++    /// TX_BUSY
++    TX_BUSY = bindings::netdev_tx_NETDEV_TX_BUSY,
++}
++
++unsafe extern "C" fn ndo_init_callback<T: NetDeviceAdapter>(
++    dev: *mut bindings::net_device,
++) -> c_types::c_int {
++    from_kernel_result! {
++        T::Ops::init(
++            unsafe { &mut NetDevice::<T>::from_pointer_mut(dev) }
++        )?;
++        Ok(0)
++    }
++}
++
++unsafe extern "C" fn ndo_uninit_callback<T: NetDeviceAdapter>(dev: *mut bindings::net_device) {
++    // SAFETY: pointer is valid as it comes form C
++    T::Ops::uninit(unsafe { &mut NetDevice::<T>::from_pointer_mut(dev) });
++}
++
++unsafe extern "C" fn ndo_start_xmit_callback<T: NetDeviceAdapter>(
++    skb: *mut bindings::sk_buff,
++    dev: *mut bindings::net_device,
++) -> bindings::netdev_tx_t {
++    T::Ops::start_xmit(unsafe { SkBuff::from_pointer(skb) }, unsafe {
++        &mut NetDevice::from_pointer_mut(dev)
++    }) as bindings::netdev_tx_t
++}
++
++unsafe extern "C" fn ndo_get_stats64_callback<T: NetDeviceAdapter>(
++    dev: *mut bindings::net_device,
++    stats: *mut bindings::rtnl_link_stats64,
++) {
++    T::Ops::get_stats64(
++        unsafe { &mut NetDevice::<T>::from_pointer_mut(dev) },
++        unsafe { &mut RtnlLinkStats64::from_pointer(stats) },
++    );
++}
++
++unsafe extern "C" fn ndo_change_carrier_callback<T: NetDeviceAdapter>(
++    dev: *mut bindings::net_device,
++    change_carrier: bool,
++) -> c_types::c_int {
++    from_kernel_result! {
++        T::Ops::change_carrier(
++            unsafe { &mut NetDevice::<T>::from_pointer_mut(dev) },
++            change_carrier
++        )?;
++        Ok(0)
++    }
++}
++
++unsafe extern "C" fn ndo_validate_addr_callback<T: NetDeviceAdapter>(
++    dev: *mut bindings::net_device,
++) -> c_types::c_int {
++    from_kernel_result! {
++        T::Ops::validate_addr(
++            unsafe { &mut NetDevice::<T>::from_pointer_mut(dev) }
++        )?;
++        Ok(0)
++    }
++}
++
++unsafe extern "C" fn ndo_set_mac_address_callback<T: NetDeviceAdapter>(
++    dev: *mut bindings::net_device,
++    p: *mut c_types::c_void,
++) -> c_types::c_int {
++    from_kernel_result! {
++        T::Ops::set_mac_addr(
++            unsafe { &mut NetDevice::<T>::from_pointer_mut(dev) },
++            p
++        )?;
++        Ok(0)
++    }
++}
++
++unsafe extern "C" fn ndo_set_rx_mode_callback<T: NetDeviceAdapter>(dev: *mut bindings::net_device) {
++    T::Ops::set_rx_mode(unsafe { &mut NetDevice::<T>::from_pointer_mut(dev) })
++}
++
++pub(crate) struct NetDeviceOperationsVtable<T: NetDeviceAdapter>(marker::PhantomData<T>);
++
++impl<T: NetDeviceAdapter> NetDeviceOperationsVtable<T> {
++    const VTABLE: bindings::net_device_ops = bindings::net_device_ops {
++        ndo_init: Some(ndo_init_callback::<T>),
++        ndo_uninit: Some(ndo_uninit_callback::<T>),
++        ndo_open: None,
++        ndo_stop: None,
++        ndo_start_xmit: Some(ndo_start_xmit_callback::<T>),
++        ndo_features_check: None,
++        ndo_select_queue: None,
++        ndo_change_rx_flags: None,
++        ndo_set_rx_mode: if T::Ops::TO_USE.set_rx_mode {
++            Some(ndo_set_rx_mode_callback::<T>)
++        } else {
++            None
++        },
++        ndo_set_mac_address: if T::Ops::TO_USE.set_mac_addr {
++            Some(ndo_set_mac_address_callback::<T>)
++        } else {
++            None
++        },
++        ndo_validate_addr: if T::Ops::TO_USE.validate_addr {
++            Some(ndo_validate_addr_callback::<T>)
++        } else {
++            None
++        },
++        ndo_do_ioctl: None,
++        ndo_set_config: None,
++        ndo_change_mtu: None,
++        ndo_neigh_setup: None,
++        ndo_tx_timeout: None,
++        ndo_get_stats64: if T::Ops::TO_USE.get_stats64 {
++            Some(ndo_get_stats64_callback::<T>)
++        } else {
++            None
++        },
++        ndo_has_offload_stats: None,
++        ndo_get_offload_stats: None,
++        ndo_get_stats: None,
++        ndo_vlan_rx_add_vid: None,
++        ndo_vlan_rx_kill_vid: None,
++
++        #[cfg(CONFIG_NET_POLL_CONTROLLER)]
++        ndo_poll_controller: None,
++        #[cfg(CONFIG_NET_POLL_CONTROLLER)]
++        ndo_netpoll_setup: None,
++        #[cfg(CONFIG_NET_POLL_CONTROLLER)]
++        ndo_netpoll_cleanup: None,
++
++        ndo_set_vf_mac: None,
++        ndo_set_vf_vlan: None,
++        ndo_set_vf_rate: None,
++        ndo_set_vf_spoofchk: None,
++        ndo_set_vf_trust: None,
++        ndo_get_vf_config: None,
++        ndo_set_vf_link_state: None,
++        ndo_get_vf_stats: None,
++        ndo_set_vf_port: None,
++        ndo_get_vf_port: None,
++        ndo_get_vf_guid: None,
++        ndo_set_vf_guid: None,
++        ndo_set_vf_rss_query_en: None,
++        ndo_setup_tc: None,
++
++        #[cfg(any(CONFIG_FCOE = "y", CONFIG_FCOE = "m"))]
++        ndo_fcoe_enable: None,
++        #[cfg(any(CONFIG_FCOE = "y", CONFIG_FCOE = "m"))]
++        ndo_fcoe_disable: None,
++        #[cfg(any(CONFIG_FCOE = "y", CONFIG_FCOE = "m"))]
++        ndo_fcoe_ddp_setup: None,
++        #[cfg(any(CONFIG_FCOE = "y", CONFIG_FCOE = "m"))]
++        ndo_fcoe_ddp_done: None,
++        #[cfg(any(CONFIG_FCOE = "y", CONFIG_FCOE = "m"))]
++        ndo_fcoe_ddp_target: None,
++        #[cfg(any(CONFIG_FCOE = "y", CONFIG_FCOE = "m"))]
++        ndo_fcoe_get_hbainfo: None,
++
++        #[cfg(any(CONFIG_LIBFCOE = "y", CONFIG_LIBFCOE = "m"))]
++        ndo_fcoe_get_wwn: None,
++
++        #[cfg(CONFIG_RFS_ACCEL)]
++        ndo_rx_flow_steer: None,
++
++        ndo_add_slave: None,
++        ndo_del_slave: None,
++        ndo_get_xmit_slave: None,
++        ndo_sk_get_lower_dev: None,
++        ndo_fix_features: None,
++        ndo_set_features: None,
++        ndo_neigh_construct: None,
++        ndo_neigh_destroy: None,
++        ndo_fdb_add: None,
++        ndo_fdb_del: None,
++        ndo_fdb_dump: None,
++        ndo_fdb_get: None,
++        ndo_bridge_setlink: None,
++        ndo_bridge_getlink: None,
++        ndo_bridge_dellink: None,
++        ndo_change_carrier: if T::Ops::TO_USE.change_carrier {
++            Some(ndo_change_carrier_callback::<T>)
++        } else {
++            None
++        },
++        ndo_get_phys_port_id: None,
++        ndo_get_port_parent_id: None,
++        ndo_get_phys_port_name: None,
++        ndo_dfwd_add_station: None,
++        ndo_dfwd_del_station: None,
++        ndo_set_tx_maxrate: None,
++        ndo_get_iflink: None,
++        ndo_change_proto_down: None,
++        ndo_fill_metadata_dst: None,
++        ndo_set_rx_headroom: None,
++        ndo_bpf: None,
++        ndo_xdp_xmit: None,
++        ndo_xsk_wakeup: None,
++        ndo_get_devlink_port: None,
++        ndo_tunnel_ctl: None,
++        ndo_get_peer_dev: None,
++        ndo_fill_forward_path: None,
++    };
++
++    /// Builds an instance of [`struct net_device_ops`].
++    ///
++    /// # Safety
++    ///
++    /// The caller must ensure that the adapter is compatible with the way the device is registered.
++    pub(crate) const unsafe fn build() -> &'static bindings::net_device_ops {
++        &Self::VTABLE
++    }
++}
++
++/// Represents which fields of [`struct net_device_ops`] should pe populated with pointers for the trait [`NetDeviceOps`].
++pub struct ToUse {
++    /// Trait defines a `ndo_change_carrier` function.
++    pub change_carrier: bool,
++
++    /// Trait defines a `ndo_get_stats64` function.
++    pub get_stats64: bool,
++
++    /// Trait defines a `ndo_validate_addr` function.
++    pub validate_addr: bool,
++
++    /// Trait defines a `ndo_set_mac_addr` function.
++    pub set_mac_addr: bool,
++
++    /// Trait defines a `ndo_set_rx_mode` function.
++    pub set_rx_mode: bool,
++}
++
++/// This trait does not include any functions exept [`init`] and [`uninit`].
++#[doc(hidden)]
++pub const USE_NONE: ToUse = ToUse {
++    change_carrier: false,
++    get_stats64: false,
++    validate_addr: false,
++    set_mac_addr: false,
++    set_rx_mode: false,
++};
++
++/// Defines the [`NetDeviceOps::TO_USE`] field based on a list of fields to be populated.
++#[macro_export]
++macro_rules! declare_net_device_ops {
++    () => {
++        const TO_USE: $crate::net::device::ToUse = $crate::net::device::USE_NONE;
++    };
++    ($($i:ident),+) => {
++        #[allow(clippy::needless_update)]
++        const TO_USE: kernel::net::device::ToUse =
++            $crate::net::device::ToUse {
++                $($i: true),+ ,
++                ..$crate::net::device::USE_NONE
++            };
++    };
++}
++
++/// Corresponds to the kernel's `struct net_device_ops`.
++///
++/// You Implement this trait whenever you would create a `struct net_device_ops`.
++pub trait NetDeviceOps<T: NetDeviceAdapter>: Send + Sync + Sized {
++    /// The methods to use to populate [`struct net_device_ops`].
++    const TO_USE: ToUse;
++
++    /// This function is called once when a network device is registered.
++    /// The network device can use this for any late stage initialization
++    /// or semantic validation. It can fail with an error code which will
++    /// be propagated back to register_netdev.
++    fn init(dev: &mut NetDevice<T>) -> Result;
++
++    /// This function is called when device is unregistered or when registration
++    /// fails. It is not called if init fails.
++    fn uninit(dev: &mut NetDevice<T>);
++
++    /// Called when a packet needs to be transmitted.
++    /// `Ok(())` returns NETDEV_TX_OK, Error maps to `NETDEV_TX_BUSY`
++    /// Returns NETDEV_TX_OK.  Can return NETDEV_TX_BUSY, but you should stop
++    /// the queue before that can happen; it's for obsolete devices and weird
++    /// corner cases, but the stack really does a non-trivial amount
++    /// of useless work if you return NETDEV_TX_BUSY.
++    #[allow(unused_variables)]
++    fn start_xmit(skb: SkBuff, dev: &mut NetDevice<T>) -> NetdevTX {
++        NetdevTX::TX_OK
++    }
++
++    /// Called when a user wants to get the network device usage
++    /// statistics.
++    ///
++    /// Must fill in a zero-initialised [`RtnlLinkStats64`] structure
++    /// passed by the caller.
++    #[allow(unused_variables)]
++    fn get_stats64(dev: &mut NetDevice<T>, stats: &mut RtnlLinkStats64) {}
++
++    /// Called to change device carrier. Soft-devices (like dummy, team, etc)
++    /// which do not represent real hardware may define this to allow their
++    /// userspace components to manage their virtual carrier state. Devices
++    /// that determine carrier state from physical hardware properties (eg
++    /// network cables) or protocol-dependent mechanisms (eg
++    /// USB_CDC_NOTIFY_NETWORK_CONNECTION) should NOT implement this function, and
++    /// therefor NOT set [`TO_USE.change_carrier`].
++    #[allow(unused_variables)]
++    fn change_carrier(dev: &mut NetDevice<T>, new_carrier: bool) -> Result {
++        Err(Error::EINVAL)
++    }
++
++    /// Test if Media Access Control address is valid for the device.
++    #[allow(unused_variables)]
++    fn validate_addr(dev: &mut NetDevice<T>) -> Result {
++        Err(Error::EINVAL)
++    }
++
++    /// This function  is called when the Media Access Control address
++    /// needs to be changed. If this interface is not defined, the
++    /// MAC address can not be changed.
++    #[allow(unused_variables)]
++    fn set_mac_addr(dev: &mut NetDevice<T>, p: *mut c_types::c_void) -> Result {
++        Err(Error::EINVAL)
++    }
++
++    /// This function is called device changes address list filtering.
++    /// If driver handles unicast address filtering, it should set
++    /// IFF_UNICAST_FLT in its priv_flags.
++    #[allow(unused_variables)]
++    fn set_rx_mode(dev: &mut NetDevice<T>) {}
++}
++
++/// Helper functions for NetDevices.
++pub mod helpers {
++    use super::*;
++
++    /// Validate the eth addres for the [`NetDevice`] `dev`.
++    pub fn eth_validate_addr<T: NetDeviceAdapter>(dev: &mut NetDevice<T>) -> Result {
++        // SAFETY: Calling a C function.
++        let ret = unsafe { bindings::eth_validate_addr(dev.get_pointer_mut()) };
++        if ret != 0 {
++            Err(Error::from_kernel_errno(ret))
++        } else {
++            Ok(())
++        }
++    }
++
++    /// Set new Ethernet hardware address.
++    ///
++    /// This doesn't change hardware matching, so needs to be overridden
++    /// for most real devices.
++    ///
++    /// # Safety
++    ///
++    /// `socket_addr` has to be a valid socket address pointer.
++    pub unsafe fn eth_mac_addr<T: NetDeviceAdapter>(
++        dev: &mut NetDevice<T>,
++        socket_addr: *mut c_types::c_void,
++    ) -> Result {
++        // SAFETY: Calling a C function .
++        let ret = unsafe { bindings::eth_mac_addr(dev.get_pointer_mut(), socket_addr) };
++
++        if ret != 0 {
++            Err(Error::from_kernel_errno(ret))
++        } else {
++            Ok(())
++        }
++    }
++}
+diff --git a/rust/kernel/net/ethtool.rs b/rust/kernel/net/ethtool.rs
+new file mode 100644
+index 000000000000..1214a8768039
+--- /dev/null
++++ b/rust/kernel/net/ethtool.rs
+@@ -0,0 +1,246 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! Ethtool Operations.
++
++use core::marker;
++
++use crate::error::{Error, Result};
++use crate::types::{SavedAsPointer, SavedAsPointerMut};
++use crate::{bindings, c_types, from_kernel_result};
++
++use super::device::{NetDevice, NetDeviceAdapter};
++
++unsafe extern "C" fn get_drvinfo_callback<T: NetDeviceAdapter>(
++    dev: *mut bindings::net_device,
++    info: *mut bindings::ethtool_drvinfo,
++) {
++    T::EthOps::get_drvinfo(
++        unsafe { &mut NetDevice::<T>::from_pointer_mut(dev) },
++        unsafe { &mut EthtoolDrvinfo::from_pointer(info) },
++    );
++}
++
++unsafe extern "C" fn get_ts_info_callback<T: NetDeviceAdapter>(
++    dev: *mut bindings::net_device,
++    info: *mut bindings::ethtool_ts_info,
++) -> c_types::c_int {
++    from_kernel_result! {
++        T::EthOps::get_ts_info(
++            // SAFETY: dev is valid, as this is a callback
++            unsafe { &mut NetDevice::<T>::from_pointer_mut(dev) },
++            // SAFETY: info is valid, as this is a callback
++            unsafe { &mut EthToolTsInfo::from_pointer(info) }
++        )?;
++        Ok(0)
++    }
++}
++
++pub(crate) struct EthToolOperationsVtable<T: NetDeviceAdapter>(marker::PhantomData<T>);
++
++impl<T: NetDeviceAdapter> EthToolOperationsVtable<T> {
++    const VTABLE: bindings::ethtool_ops = bindings::ethtool_ops {
++        _bitfield_1: bindings::__BindgenBitfieldUnit::<[u8; 1usize], u8>::new([0u8; 1usize]),
++
++        supported_coalesce_params: 0,
++        get_drvinfo: if T::EthOps::TO_USE.get_drvinfo {
++            Some(get_drvinfo_callback::<T>)
++        } else {
++            None
++        },
++        get_regs_len: None,
++        get_regs: None,
++        get_wol: None,
++        set_wol: None,
++        get_msglevel: None,
++        set_msglevel: None,
++        nway_reset: None,
++        get_link: None,
++        get_link_ext_state: None,
++        get_eeprom_len: None,
++        get_eeprom: None,
++        set_eeprom: None,
++        get_coalesce: None,
++        set_coalesce: None,
++        get_ringparam: None,
++        set_ringparam: None,
++        get_pause_stats: None,
++        get_pauseparam: None,
++        set_pauseparam: None,
++        self_test: None,
++        get_strings: None,
++        set_phys_id: None,
++        get_ethtool_stats: None,
++        begin: None,
++        complete: None,
++        get_priv_flags: None,
++        set_priv_flags: None,
++        get_sset_count: None,
++        get_rxnfc: None,
++        set_rxnfc: None,
++        flash_device: None,
++        reset: None,
++        get_rxfh_key_size: None,
++        get_rxfh_indir_size: None,
++        get_rxfh: None,
++        set_rxfh: None,
++        get_rxfh_context: None,
++        set_rxfh_context: None,
++        get_channels: None,
++        set_channels: None,
++        get_dump_flag: None,
++        get_dump_data: None,
++        set_dump: None,
++        get_ts_info: if T::EthOps::TO_USE.get_ts_info {
++            Some(get_ts_info_callback::<T>)
++        } else {
++            None
++        },
++        get_module_info: None,
++        get_module_eeprom: None,
++        get_eee: None,
++        set_eee: None,
++        get_tunable: None,
++        set_tunable: None,
++        get_per_queue_coalesce: None,
++        set_per_queue_coalesce: None,
++        get_link_ksettings: None,
++        set_link_ksettings: None,
++        get_fec_stats: None,
++        get_fecparam: None,
++        set_fecparam: None,
++        get_ethtool_phy_stats: None,
++        get_phy_tunable: None,
++        set_phy_tunable: None,
++        get_module_eeprom_by_page: None,
++        get_eth_phy_stats: None,
++        get_eth_mac_stats: None,
++        get_eth_ctrl_stats: None,
++        get_rmon_stats: None,
++    };
++
++    /// Builds an instance of [`struct ethtool_ops`].
++    ///
++    /// # Safety
++    ///
++    /// The caller must ensure that the adapter is compatible with the way the device is registered.
++    pub(crate) const unsafe fn build() -> &'static bindings::ethtool_ops {
++        &Self::VTABLE
++    }
++}
++
++/// Represents which fields of [`struct ethtool_ops`] should be populated with pointers for the trait [`EthToolOps`]
++pub struct EthToolToUse {
++    /// Trait defines a `get_drvinfo` function.
++    pub get_drvinfo: bool,
++
++    /// Trait defines a `get_ts_info` function.
++    pub get_ts_info: bool,
++}
++
++/// This trait does not include any functions.
++#[doc(hidden)]
++pub const ETH_TOOL_USE_NONE: EthToolToUse = EthToolToUse {
++    get_drvinfo: false,
++    get_ts_info: false,
++};
++
++/// Defines the [`EthToolOps::TO_USE`] field based on a list of fields to be populated.
++#[macro_export]
++macro_rules! declare_eth_tool_ops {
++    () => {
++        const TO_USE: $crate::net::ethtool::EthToolToUse = $crate::net::ethtool::ETH_TOOL_USE_NONE;
++    };
++    ($($i:ident),+) => {
++        #[allow(clippy::needless_update)]
++        const TO_USE: kernel::net::ethtool::EthToolToUse =
++            $crate::net::ethtool::EthToolToUse {
++                $($i: true),+ ,
++                ..$crate::net::ethtool::ETH_TOOL_USE_NONE
++            };
++    };
++}
++
++/// Operations table needed for ethtool.
++/// [`Self::TO_USE`] defines which functions are implemented by this type.
++pub trait EthToolOps<T: NetDeviceAdapter>: Send + Sync + Sized {
++    /// Struct [`EthToolToUse`] which signals which function are ipmlemeted by this type.
++    const TO_USE: EthToolToUse;
++
++    /// Report driver/device information.  Should only set the
++    /// @driver, @version, @fw_version and @bus_info fields.  If not
++    /// implemented, the @driver and @bus_info fields will be filled in
++    /// according to the netdev's parent device.
++    #[allow(unused_variables)]
++    fn get_drvinfo(dev: &mut NetDevice<T>, info: &mut EthtoolDrvinfo) {}
++
++    /// Get the time stamping and PTP hardware clock capabilities.
++    /// Drivers supporting transmit time stamps in software should set this to
++    /// [`helpers::ethtool_op_get_ts_info`].
++    #[allow(unused_variables)]
++    fn get_ts_info(dev: &mut NetDevice<T>, info: &mut EthToolTsInfo) -> Result {
++        Err(Error::EINVAL)
++    }
++}
++
++/// Wrappes the [`bindings::ethtool_ts_info`] struct.
++#[repr(transparent)]
++pub struct EthToolTsInfo {
++    ptr: *const bindings::ethtool_ts_info,
++}
++
++impl SavedAsPointer for EthToolTsInfo {
++    type InternalType = bindings::ethtool_ts_info;
++
++    fn get_pointer(&self) -> *const Self::InternalType {
++        self.ptr
++    }
++
++    unsafe fn from_pointer(ptr: *const Self::InternalType) -> Self {
++        Self { ptr }
++    }
++}
++
++impl SavedAsPointerMut for EthToolTsInfo {
++    unsafe fn from_pointer_mut(ptr: *mut Self::InternalType) -> Self {
++        unsafe { Self::from_pointer(ptr as *const Self::InternalType) }
++    }
++}
++
++/// Wrappes the [`bindings::ethtool_drvinfo`] struct.
++pub struct EthtoolDrvinfo {
++    ptr: *const bindings::ethtool_drvinfo,
++}
++
++impl SavedAsPointer for EthtoolDrvinfo {
++    type InternalType = bindings::ethtool_drvinfo;
++
++    fn get_pointer(&self) -> *const Self::InternalType {
++        self.ptr
++    }
++
++    unsafe fn from_pointer(ptr: *const Self::InternalType) -> Self {
++        Self { ptr }
++    }
++}
++
++impl SavedAsPointerMut for EthtoolDrvinfo {
++    unsafe fn from_pointer_mut(ptr: *mut Self::InternalType) -> Self {
++        unsafe { Self::from_pointer(ptr as *const Self::InternalType) }
++    }
++}
++
++/// Helper functions for ethtool.
++pub mod helpers {
++    use super::*;
++
++    /// Get ts info for the device `dev`.
++    pub fn ethtool_op_get_ts_info<T: NetDeviceAdapter>(
++        dev: &mut NetDevice<T>,
++        info: &mut EthToolTsInfo,
++    ) -> Result {
++        // SAFETY: info.ptr is valid if info is valid
++        // SAFETY: Calling C function
++        unsafe { bindings::ethtool_op_get_ts_info(dev.get_pointer_mut(), info.get_pointer_mut()) };
++        Ok(())
++    }
++}
+diff --git a/rust/kernel/net/mod.rs b/rust/kernel/net/mod.rs
+new file mode 100644
+index 000000000000..f55944a5e039
+--- /dev/null
++++ b/rust/kernel/net/mod.rs
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! Network subsystem in rust for linux kernel.
++
++use core::mem;
++
++pub mod device;
++pub mod ethtool;
++pub mod netlink;
++pub mod rtnl;
++pub mod skbuff;
++
++#[doc(inline)]
++pub use macros::rtnl_link_ops;
++
++/// Determine if the Ethernet address is a multicast.
++///
++/// Return true if the address is a multicast address.
++/// By definition the broadcast address is also a multicast address.
++///
++/// # Parameters
++/// - `addr`: Pointer to a six-byte array containing the Ethernet address
++///
++/// # Safety
++/// `addr` has to be a valid address pointer
++#[cfg(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)]
++pub unsafe fn is_multicast_ether_addr(addr: *const u8) -> bool {
++    // SAFETY: addr is a valid address pointer as above required, and has efficient unaligned access as KCONFIG stats
++    let a: u32 = unsafe { core::ptr::read_unaligned(addr as *const u32) };
++
++    if cfg!(target_endian = "big") {
++        (0x01 & (a >> (((mem::size_of::<u32>() as u32) * 8) - 8))) != 0
++    } else {
++        (0x01 & a) != 0
++    }
++}
++
++/// Determine if the Ethernet address is a multicast.
++///
++/// Return true if the address is a multicast address.
++/// By definition the broadcast address is also a multicast address.
++///
++/// # Parameters
++/// - `addr`: Pointer to a six-byte array containing the Ethernet address
++///
++/// # Safety
++/// `addr` has to be a valid address pointer
++#[cfg(not(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS))]
++pub unsafe fn is_multicast_ether_addr(addr: *const u8) -> bool {
++    let a: u16 = unsafe { *(addr as *const u16) };
++
++    if cfg!(target_endian = "big") {
++        (0x01 & (a >> (((mem::size_of::<u16>() as u16) * 8) - 8))) != 0
++    } else {
++        (0x01 & a) != 0
++    }
++}
++
++/// Determine if give Ethernet address is all zeros.
++/// Return true if the address is all zeroes.
++///
++/// # Parameters
++/// - `addr`: Pointer to a six-byte array containing the Ethernet address
++///
++/// # Safety
++/// `addr` must point to a valid ethernet address and is 16-bit aligned
++#[cfg(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)]
++pub unsafe fn is_zero_ether_addr(addr: *const u8) -> bool {
++    // SAFETY: addr points to a valid ethernet address and is 16-bit aligned as required above.
++    unsafe { *(addr.cast::<u32>()) | *(addr.add(4).cast::<u16>()) as u32 == 0 }
++}
++
++///
++/// # Parameters
++/// - `addr`: Pointer to a six-byte array containing the Ethernet address
++///
++/// # Safety
++/// Please note: addr must be aligned to u16.
++#[cfg(not(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS))]
++pub unsafe fn is_zero_ether_addr(addr: *const u8) -> bool {
++    unsafe { *(addr as *const [u16; 3]) == [0; 3] }
++}
++
++///  is_valid_ether_addr - Determine if the given Ethernet address is valid.
++/// Check that the Ethernet address (MAC) is not 00:00:00:00:00:00, is not
++/// a multicast address, and is not FF:FF:FF:FF:FF:FF.
++///
++/// Return true if the address is valid.
++///
++/// # Parameters
++/// - `addr`: Pointer to a six-byte array containing the Ethernet address
++///
++/// # Safety
++/// Please note: addr must be aligned to u16.
++pub unsafe fn is_valid_ether_addr(addr: *const u8) -> bool {
++    // SAFETY: function already unsafe
++    unsafe { !is_multicast_ether_addr(addr) && !is_zero_ether_addr(addr) }
++}
++
++/// Prelude for all net related imports.
++pub mod prelude {
++    pub use super::rtnl_link_ops;
++    pub use super::{
++        device::{NetDevice, NetDeviceAdapter, NetDeviceOps},
++        ethtool::{self, EthToolOps},
++        rtnl::{RtnlLinkOps, RtnlLock},
++        skbuff::SkBuff,
++    };
++}
+diff --git a/rust/kernel/net/netlink.rs b/rust/kernel/net/netlink.rs
+new file mode 100644
+index 000000000000..7846abf14965
+--- /dev/null
++++ b/rust/kernel/net/netlink.rs
+@@ -0,0 +1,128 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! Netlink helpers.
++
++use crate::bindings;
++use crate::types::SavedAsPointer;
++
++/// Octets in one ethernet addr
++pub const ETH_ALEN: u16 = bindings::ETH_ALEN as u16;
++
++const NLA_HDRLEN: i32 = bindings::BINDINGS_NLA_HDRLEN;
++/// Max Position for NlAttrVec.
++pub const __IFLA_MAX: usize = bindings::__IFLA_MAX as usize;
++
++/// Wrapper for the kernels [`bindings::nlattr`] type.
++#[repr(transparent)]
++pub struct NlAttr {
++    ptr: *const bindings::nlattr,
++}
++
++impl NlAttr {
++    /// Check If the netlink is 0, This can happen in [`NlAttrVec`] structs.
++    pub fn is_null(&self) -> bool {
++        self.ptr.is_null()
++    }
++
++    /// Return the length of the nla data.
++    /// Returns None if [`Self::is_null`] is true.
++    pub fn nla_len(&self) -> Option<u16> {
++        if self.is_null() {
++            return None;
++        }
++
++        // NO-PANIC: self is valid and not null.
++        // SAFETY: ptr is valid if self is valid.
++        Some(self.get_internal().nla_len - NLA_HDRLEN as u16)
++    }
++
++    /// Get a pointer to the data inside the nla package.
++    ///
++    /// # Safety
++    /// ptr is valid, but could be NULL
++    pub unsafe fn data(&self) -> *const i8 {
++        ((self.ptr as usize) + NLA_HDRLEN as usize) as *const i8
++    }
++
++    /// Check if address inside the data is valid.
++    pub fn is_valid_ether_addr(&self) -> bool {
++        // SAFETY: self.ptr is valid if self is valid.
++        unsafe {
++            let data = self.data() as *const u8;
++            super::is_valid_ether_addr(data)
++        }
++    }
++
++    /// Return a owned version of Self.
++    /// The pointer inside of [`Self::get_pointer`] still shows onto the same data.
++    unsafe fn clone(&self) -> Self {
++        Self { ptr: self.ptr }
++    }
++}
++
++impl SavedAsPointer for NlAttr {
++    type InternalType = bindings::nlattr;
++
++    fn get_pointer(&self) -> *const Self::InternalType {
++        self.ptr
++    }
++
++    unsafe fn from_pointer(ptr: *const Self::InternalType) -> Self {
++        Self { ptr }
++    }
++}
++
++/// Wrapper for the kernels [`bindings::netlink_ext_ack`] stuct.
++#[repr(transparent)]
++pub struct NlExtAck {
++    ptr: *const bindings::netlink_ext_ack,
++}
++
++impl SavedAsPointer for NlExtAck {
++    type InternalType = bindings::netlink_ext_ack;
++
++    fn get_pointer(&self) -> *const Self::InternalType {
++        self.ptr
++    }
++
++    unsafe fn from_pointer(ptr: *const Self::InternalType) -> Self {
++        Self { ptr }
++    }
++}
++
++/// Wrapper for a list of [`NlAttr`] with size [`__IFLA_MAX`].
++#[repr(transparent)]
++pub struct NlAttrVec {
++    ptr: *const *const bindings::nlattr,
++}
++
++impl NlAttrVec {
++    /// Get The [`NlAttr`] from position `offset`.
++    ///
++    /// Returns None if `offset` is bigger than [`__IFLA_MAX`].
++    pub fn get(&self, offset: u32) -> Option<NlAttr> {
++        if offset > __IFLA_MAX as u32 {
++            return None;
++        }
++
++        let vec = unsafe { &*(self.ptr as *const [NlAttr; __IFLA_MAX]) };
++        let nlattr = &vec[offset as usize];
++        if nlattr.is_null() {
++            None
++        } else {
++            Some(unsafe { nlattr.clone() })
++        }
++    }
++}
++
++impl SavedAsPointer for NlAttrVec {
++    type InternalType = *const bindings::nlattr;
++
++    fn get_pointer(&self) -> *const Self::InternalType {
++        self.ptr
++    }
++
++    unsafe fn from_pointer(ptr: *const Self::InternalType) -> Self {
++        Self { ptr }
++    }
++}
+diff --git a/rust/kernel/net/rtnl.rs b/rust/kernel/net/rtnl.rs
+new file mode 100644
+index 000000000000..566f546bc1cd
+--- /dev/null
++++ b/rust/kernel/net/rtnl.rs
+@@ -0,0 +1,149 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! Rtnl Link Operations.
++
++use core::ptr;
++
++use crate::bindings;
++use crate::error::{Error, Result};
++
++use super::device::{NetDevice, NetDeviceAdapter};
++
++use crate::types::{SavedAsPointer, SavedAsPointerMut};
++
++// TODO: inner bool, to allow other unlock mechanism?
++/// Lock, acquired via [`bindings::rtnl_lock`].
++#[must_use = "the rtnl unlocks immediately when the guard is unused"]
++pub struct RtnlLock {
++    _private: (),
++}
++
++impl RtnlLock {
++    /// Creat a new lock via [`bindings::rtnl_lock`].
++    pub fn lock() -> Self {
++        // SAFETY: C function without parameters
++        unsafe { bindings::rtnl_lock() };
++
++        Self { _private: () }
++    }
++}
++
++impl Drop for RtnlLock {
++    fn drop(&mut self) {
++        // SAFETY: C function without parameters
++        unsafe { bindings::rtnl_unlock() };
++    }
++}
++
++#[doc(hidden)]
++/// Empty [`bindings::rtnl_link_ops`] table.
++pub const RTNL_LINK_OPS_EMPTY: bindings::rtnl_link_ops = bindings::rtnl_link_ops {
++    list: bindings::list_head {
++        next: ptr::null::<bindings::list_head>() as *mut bindings::list_head,
++        prev: ptr::null::<bindings::list_head>() as *mut bindings::list_head,
++    },
++    kind: ptr::null::<i8>(),
++    priv_size: 0,
++    setup: None,
++    netns_refund: false,
++    maxtype: 0,
++    policy: ptr::null::<bindings::nla_policy>(),
++    validate: None,
++    newlink: None,
++    changelink: None,
++    dellink: None,
++    get_size: None,
++    fill_info: None,
++    get_xstats_size: None,
++    fill_xstats: None,
++    get_num_tx_queues: None,
++    get_num_rx_queues: None,
++    slave_maxtype: 0,
++    slave_policy: ptr::null::<bindings::nla_policy>(),
++    slave_changelink: None,
++    get_slave_size: None,
++    fill_slave_info: None,
++    get_link_net: None,
++    get_linkxstats_size: None,
++    fill_linkxstats: None,
++};
++
++/// Transparent wrapper for [`bindings::rtnl_link_ops`] for the macro [`crate::net::rtnl_link_ops`].
++#[repr(transparent)]
++pub struct RtnlLinkOps(bindings::rtnl_link_ops);
++
++unsafe impl Sync for RtnlLinkOps {}
++
++impl RtnlLinkOps {
++    /// Register this op table with kernel.
++    pub fn register(&self) -> Result {
++        let ptr = self.as_ptr();
++
++        // SAFETY: Calling C function
++        let ret = unsafe { bindings::rtnl_link_register(ptr as *mut bindings::rtnl_link_ops) };
++
++        if ret != 0 {
++            Err(Error::from_kernel_errno(ret))
++        } else {
++            Ok(())
++        }
++    }
++
++    /// Get a pointer to this struct.
++    pub fn as_ptr(&self) -> *const bindings::rtnl_link_ops {
++        &self.0 as *const _ as *const bindings::rtnl_link_ops
++    }
++
++    /// Deregister the op table from the kernel.
++    pub fn unregister(&self) {
++        let ptr = self.as_ptr() as *mut bindings::rtnl_link_ops;
++
++        // SAFETY: ptr is valid if self is valid
++        unsafe { bindings::rtnl_link_unregister(ptr) };
++    }
++
++    #[doc(hidden)]
++    /// Create an new unchecked version needed for the [`crate::net::rtnl_link_ops`] macro.
++    pub const fn new_from_inner(inner: bindings::rtnl_link_ops) -> Self {
++        Self(inner)
++    }
++}
++
++/// Wrapper for a kernel [`bindings::rtnl_link_stats64`].
++#[repr(transparent)]
++pub struct RtnlLinkStats64 {
++    ptr: *const bindings::rtnl_link_stats64,
++}
++
++impl RtnlLinkStats64 {
++    /// Read the lstats from the [`NetDevice`] `dev` to [`Self`].
++    pub fn dev_read<T: NetDeviceAdapter>(&mut self, dev: &mut NetDevice<T>) {
++        let stats = self.get_internal_mut();
++        // SAFETY: call to C function
++        unsafe {
++            bindings::dev_lstats_read(
++                dev.get_pointer_mut(),
++                &mut stats.tx_packets as *mut u64,
++                &mut stats.tx_bytes as *mut u64,
++            );
++        }
++    }
++}
++
++impl SavedAsPointer for RtnlLinkStats64 {
++    type InternalType = bindings::rtnl_link_stats64;
++
++    fn get_pointer(&self) -> *const Self::InternalType {
++        self.ptr
++    }
++
++    unsafe fn from_pointer(ptr: *const Self::InternalType) -> Self {
++        Self { ptr }
++    }
++}
++
++impl SavedAsPointerMut for RtnlLinkStats64 {
++    unsafe fn from_pointer_mut(ptr: *mut Self::InternalType) -> Self {
++        unsafe { Self::from_pointer(ptr as *const Self::InternalType) }
++    }
++}
+diff --git a/rust/kernel/net/skbuff.rs b/rust/kernel/net/skbuff.rs
+new file mode 100644
+index 000000000000..dd106f5a9db7
+--- /dev/null
++++ b/rust/kernel/net/skbuff.rs
+@@ -0,0 +1,149 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! Definitors for the struct [`crate::bindings::sk_buff`] memory handlers.
++
++use core::{ops::Drop, ptr};
++
++use crate::bindings;
++use crate::types::SavedAsPointer;
++
++/// Wraps the kernel's `struct sk_buff`.
++///
++/// # Invariants
++///
++/// The pointer `Self::ptr` is non-null and valid.
++#[repr(transparent)]
++pub struct SkBuff {
++    ptr: *const bindings::sk_buff,
++}
++
++impl SkBuff {
++    /// Binding to `bindings::skb_clone_tx_timestamp`.
++    ///
++    /// Noop if `CONFIG_NETWORK_PHY_TIMESTAMPING` is not enabled.
++    #[cfg(CONFIG_NETWORK_PHY_TIMESTAMPING)]
++    pub fn clone_tx_timestamp(&mut self) {
++        // SAFETY: self.ptr is valid if self is valid.
++        unsafe {
++            bindings::skb_clone_tx_timestamp(self.ptr as *mut bindings::sk_buff);
++        }
++    }
++
++    /// Binding to `bindings::skb_clone_tx_timestamp`.
++    ///
++    /// Noop if `CONFIG_NETWORK_PHY_TIMESTAMPING` is not enabled.
++    #[cfg(not(CONFIG_NETWORK_PHY_TIMESTAMPING))]
++    pub fn clone_tx_timestamp(&mut self) {
++        // NOOP
++    }
++
++    /// Driver hook for transmit timestamping.
++    ///
++    /// Ethernet MAC Drivers should call this function in their hard_xmit()
++    /// function immediately before giving the sk_buff to the MAC hardware.
++    ///
++    /// Specifically, one should make absolutely sure that this function is
++    /// called before TX completion of this packet can trigger.  Otherwise
++    /// the packet could potentially already be freed.
++    pub fn tx_timestamp(&mut self) {
++        self.clone_tx_timestamp();
++        if self.shinfo().tx_flags() as u32 & bindings::SKBTX_SW_TSTAMP != 0 {
++            unsafe {
++                bindings::skb_tstamp_tx(self.ptr as *mut bindings::sk_buff, ptr::null_mut());
++            }
++        }
++    }
++
++    /// Length of the [`SkBuff`].
++    #[allow(clippy::len_without_is_empty)]
++    pub fn len(&self) -> u32 {
++        self.get_internal().len
++    }
++
++    /// Get the Shared info for this SKBuffer.
++    pub fn shinfo(&self) -> SkbSharedInfo {
++        // SAFETY: self.ptr is valid if self is valid
++        unsafe {
++            let info = self.shinfo_int();
++            SkbSharedInfo::from_pointer(info)
++        }
++    }
++
++    unsafe fn shinfo_int(&self) -> *mut bindings::skb_shared_info {
++        self.end_pointer() as *mut bindings::skb_shared_info
++    }
++
++    // NET_SKBUFF_DATA_USES_OFFSET
++    #[cfg(target_pointer_width = "64")]
++    fn end_pointer(&self) -> *mut u8 {
++        let sk_ref = self.get_internal();
++        (sk_ref.head as usize + sk_ref.end as usize) as *mut u8
++    }
++
++    // !NET_SKBUFF_DATA_USES_OFFSET
++    #[cfg(not(target_pointer_width = "64"))]
++    fn end_pointer(&self) -> *mut u8 {
++        let sk_ref = self.get_internal();
++        sk_ref.end as *mut u8
++    }
++}
++
++impl SavedAsPointer for SkBuff {
++    type InternalType = bindings::sk_buff;
++
++    fn get_pointer(&self) -> *const Self::InternalType {
++        self.ptr
++    }
++
++    unsafe fn from_pointer(ptr: *const Self::InternalType) -> Self {
++        Self { ptr }
++    }
++}
++
++// TODO: is this sound?
++impl Drop for SkBuff {
++    #[cfg(CONFIG_TRACEPOINTS)]
++    fn drop(&mut self) {
++        // SAFETY: self.ptr is valid if self is valid
++        unsafe {
++            bindings::consume_skb(self.ptr as *mut bindings::sk_buff);
++        }
++    }
++
++    #[cfg(not(CONFIG_TRACEPOINTS))]
++    fn drop(&mut self) {
++        // SAFETY: self.ptr is valid if self is valid
++        unsafe {
++            bindings::kfree_skb(self.ptr as *mut bindings::sk_buff);
++        }
++    }
++}
++
++/// Wraps the kernel's `struct skb_shared_info`.
++///
++/// # Invariants
++///
++/// The pointer `Self::ptr` is non-null and valid.
++#[repr(transparent)]
++pub struct SkbSharedInfo {
++    ptr: *const bindings::skb_shared_info,
++}
++
++impl SkbSharedInfo {
++    /// The `tx_flag` field of the wrapped [`bindings::skb_shared_info`]
++    pub fn tx_flags(&self) -> u8 {
++        self.get_internal().tx_flags
++    }
++}
++
++impl SavedAsPointer for SkbSharedInfo {
++    type InternalType = bindings::skb_shared_info;
++
++    fn get_pointer(&self) -> *const Self::InternalType {
++        self.ptr
++    }
++
++    unsafe fn from_pointer(ptr: *const Self::InternalType) -> Self {
++        Self { ptr }
++    }
++}
+diff --git a/rust/kernel/types.rs b/rust/kernel/types.rs
+index fbf2766a9571..88a06d69d124 100644
+--- a/rust/kernel/types.rs
++++ b/rust/kernel/types.rs
+@@ -703,3 +703,52 @@ pub enum Either<L, R> {
+     /// Constructs an instance of [`Either`] containing a value of type `R`.
+     Right(R),
+ }
++/// Trait for wrappers which are holding a direct pointer that they are getting from a C side function.
++pub trait SavedAsPointer {
++    /// The underlying C type from [`crate::bindings`] which this Wrapper is containing.
++    type InternalType;
++
++    /// Regturns the raw pointer stored in the wrapper.
++    fn get_pointer(&self) -> *const Self::InternalType;
++
++    /// Returns the instance back which contains the raw pointer `ptr`.
++    ///
++    /// # Safety
++    ///
++    /// The passed pointer must be valid and of type `*const [`Self::InternalType`]`.
++    unsafe fn from_pointer(ptr: *const Self::InternalType) -> Self;
++
++    /// Returns a reference to to the internal struct
++    fn get_internal(&self) -> &Self::InternalType {
++        let ptr = self.get_pointer();
++
++        // SAFETY: self must be constructed via [`Self::from_pointer`].
++        unsafe { ptr.as_ref() }.unwrap()
++    }
++}
++
++/// Trait for wrappers which are holding a mutable direct pointer that they are getting from a C side function.
++///
++/// Extends [`SavedAsPointer`] with the addition of mutability.
++pub trait SavedAsPointerMut: SavedAsPointer {
++    /// Return a mutable pointer to the underlying struct.
++    fn get_pointer_mut(&mut self) -> *mut Self::InternalType {
++        self.get_pointer() as *mut Self::InternalType
++    }
++
++    /// Returns the instance back which contains the raw pointer `ptr`.
++    ///
++    /// # Safety
++    ///
++    /// The passed pointer must be valid and of type `*mut [`Self::InternalType`]`.
++    unsafe fn from_pointer_mut(ptr: *mut Self::InternalType) -> Self;
++
++    // TODO: can I implement Self::from_pointer for the trait SavedAsPointer?
++
++    /// Returns a mutable referecne to the internal struct.
++    fn get_internal_mut(&mut self) -> &mut Self::InternalType {
++        let ptr = self.get_pointer() as *mut Self::InternalType;
++
++        unsafe { ptr.as_mut() }.unwrap()
++    }
++}
+diff --git a/rust/macros/helpers.rs b/rust/macros/helpers.rs
+index 8b5f9bc414d7..94d3fef71f5e 100644
+--- a/rust/macros/helpers.rs
++++ b/rust/macros/helpers.rs
+@@ -76,14 +76,58 @@ pub(crate) fn expect_string_ascii(it: &mut token_stream::IntoIter) -> String {
+     let string = try_string(it).expect("Expected string");
+     assert!(string.is_ascii(), "Expected ASCII string");
+     string
++/* DEBUG_CONFLICT
++pub(crate) fn expect_byte_string(it: &mut token_stream::IntoIter) -> String {
++    try_byte_string(it).expect("Expected byte string")
+ }
+ 
++#[derive(Clone, PartialEq)]
++pub(crate) enum ParamType {
++    Ident(String),
++    Array { vals: String, max_length: usize },
++}
++
++pub(crate) fn expect_array_fields(it: &mut token_stream::IntoIter) -> ParamType {
++    assert_eq!(expect_punct(it), '<');
++    let vals = expect_ident(it);
++    assert_eq!(expect_punct(it), ',');
++    let max_length_str = expect_literal(it);
++    let max_length = max_length_str
++        .parse::<usize>()
++        .expect("Expected usize length");
++    assert_eq!(expect_punct(it), '>');
++    ParamType::Array { vals, max_length }
++}
++
++pub(crate) fn expect_type(it: &mut token_stream::IntoIter) -> ParamType {
++    if let TokenTree::Ident(ident) = it
++        .next()
++        .expect("Reached end of token stream for param type")
++    {
++        match ident.to_string().as_ref() {
++            "ArrayParam" => expect_array_fields(it),
++            _ => ParamType::Ident(ident.to_string()),
++        }
++    } else {
++        panic!("Expected Param Type")
++    }
++}
++*/
++
+ pub(crate) fn expect_end(it: &mut token_stream::IntoIter) {
+     if it.next().is_some() {
+         panic!("Expected end");
+     }
+ }
+ 
++pub(crate) fn get_ident(it: &mut token_stream::IntoIter, expected_name: &str) -> String {
++    assert_eq!(expect_ident(it), expected_name);
++    assert_eq!(expect_punct(it), ':');
++    let ident = expect_ident(it);
++    assert_eq!(expect_punct(it), ',');
++    ident
++}
++
+ pub(crate) fn get_literal(it: &mut token_stream::IntoIter, expected_name: &str) -> String {
+     assert_eq!(expect_ident(it), expected_name);
+     assert_eq!(expect_punct(it), ':');
+@@ -98,4 +142,12 @@ pub(crate) fn get_string(it: &mut token_stream::IntoIter, expected_name: &str) -
+     let string = expect_string(it);
+     assert_eq!(expect_punct(it), ',');
+     string
++/* DEBUG_CONFLICT
++pub(crate) fn get_byte_string(it: &mut token_stream::IntoIter, expected_name: &str) -> String {
++    assert_eq!(expect_ident(it), expected_name);
++    assert_eq!(expect_punct(it), ':');
++    let byte_string = expect_byte_string(it);
++    assert_eq!(expect_punct(it), ',');
++    byte_string
+ }
++*/
+diff --git a/rust/macros/lib.rs b/rust/macros/lib.rs
+index 397e1496da28..ecc9b11a96a4 100644
+--- a/rust/macros/lib.rs
++++ b/rust/macros/lib.rs
+@@ -7,6 +7,9 @@ mod helpers;
+ mod module;
+ mod vtable;
+ 
++/// network module/driver macros
++mod net;
++
+ use proc_macro::TokenStream;
+ 
+ /// Declares a kernel module.
+@@ -189,3 +192,59 @@ pub fn vtable(attr: TokenStream, ts: TokenStream) -> TokenStream {
+ pub fn concat_idents(ts: TokenStream) -> TokenStream {
+     concat_idents::concat_idents(ts)
+ }
++
++/// Declares a rtnl link operation table.
++///
++/// The `type` argument should match the type used for `T` in `NetDevice`.
++///
++/// # Examples
++///
++/// ```rust,ignore
++/// use kernel::prelude::*;
++/// use kernel::net::prelude::*;
++///
++/// fn setup(dev: &mut NetDevice<DummyRsDev>) {
++///     dev.ether_setup();
++///
++///     dev.set_ops();
++///     // ...
++/// }
++///
++/// rtnl_link_ops! {
++///     kind: b"dummy_rs",
++///     type: DummyRsDev,
++///     setup: setup,
++///     maxtype: 20,
++/// }
++///
++/// struct DummyRsDev;
++///
++/// impl NetDeviceOps<Self> for DummyRsDev {
++///     kernel::declare_net_device_ops!();
++///
++///     fn init(dev: &NetDevice<Self>) -> KernelResult<()> {
++///        Ok(())
++///     }
++///
++///     fn uninit(dev: &NetDevice<Self>) {
++///
++///     }
++/// }
++///
++/// impl EthToolOps<Self> for DummyRsDev {
++///     kernel::declare_eth_tool_ops!();
++/// }
++///
++/// fn call_from_module_init() -> KernelResult<()> {
++///     let mut dev = NetDevice::new(DummyRsDev, kernel::cstr!("dummyrs%d"), kernel::net::device::NetNameAssingType::Enum, 1, 1)?;
++///
++///     dev.register();
++///     dev.set_rtnl_ops(dummy_rs_rtnl_link_ops);
++///
++///     Ok(())
++/// }
++/// ```
++#[proc_macro]
++pub fn rtnl_link_ops(ts: TokenStream) -> TokenStream {
++    net::rtnl_link_ops(ts)
++}
+diff --git a/rust/macros/net.rs b/rust/macros/net.rs
+new file mode 100644
+index 000000000000..7c719d318909
+--- /dev/null
++++ b/rust/macros/net.rs
+@@ -0,0 +1,144 @@
++// SPDX-License-Identifier: GPL-2.0
++use proc_macro::{TokenStream, TokenTree};
++
++use super::helpers::*;
++
++pub fn rtnl_link_ops(ts: TokenStream) -> TokenStream {
++    let mut it = ts.into_iter();
++    let literals = &["maxtype", "policy", "slave_maxtype", "slave_policy"];
++
++    let mut found_idents = Vec::new();
++
++    let kind = get_byte_string(&mut it, "kind");
++    let netdevice = get_ident(&mut it, "type");
++
++    let mut callbacks = String::new();
++    let mut fields = String::new();
++
++    loop {
++        let name = match it.next() {
++            Some(TokenTree::Ident(ident)) => ident.to_string(),
++            Some(_) => panic!("Expected Ident or End"),
++            None => break,
++        };
++
++        assert_eq!(expect_punct(&mut it), ':');
++
++        if literals.contains(&name.as_str()) {
++            let literal = expect_literal(&mut it);
++            fields.push_str(&format!(
++                "{name}: {literal},\n",
++                name = name,
++                literal = literal
++            ));
++        } else {
++            let func = expect_ident(&mut it);
++            callbacks.push_str(&build_rtnl_links_callback(&name, &netdevice, &func, &kind));
++            found_idents.push(name);
++        }
++
++        assert_eq!(expect_punct(&mut it), ',');
++    }
++    expect_end(&mut it);
++
++    let callback_fields = found_idents
++        .iter()
++        .map(|name| format!("{}: Some(__rtnl_link_{}_callback_{}),", name, name, kind))
++        .collect::<Vec<String>>()
++        .join("\n");
++
++    let ops_struct = format!(
++        r#"
++             #[doc(hidden)]
++             #[used]
++             #[no_mangle]
++             pub static mut {kind}_LINK_OPS: kernel::net::rtnl::RtnlLinkOps = kernel::net::rtnl::RtnlLinkOps::new_from_inner(kernel::bindings::rtnl_link_ops {{
++                 priv_size: core::mem::size_of::<<{netdevice} as kernel::net::device::NetDeviceAdapter>::Inner>(),
++                 kind: b"{kind}\0".as_ptr() as *const i8,
++                 {callback_fields}
++                 {fields}
++                 ..kernel::net::rtnl::RTNL_LINK_OPS_EMPTY                
++             }});
++         "#,
++        kind = kind,
++        netdevice = netdevice,
++        callback_fields = callback_fields,
++        fields = fields,
++    );
++
++    format!(
++        r#"
++         {callbacks}
++         #[cfg_attr(any(CONFIG_X86, CONFIG_SPARC64), link_section = ".data.read_mostly")]
++         {ops_struct}
++         "#,
++        callbacks = callbacks,
++        ops_struct = ops_struct,
++    )
++    .parse()
++    .expect("Error parsing formatted string into token stream.")
++}
++
++struct RtnlLinkValues {
++    callback_params: String,
++    return_type: String,
++    wrapper_before: String,
++    wrapper_after: String,
++    params: String,
++}
++
++impl RtnlLinkValues {
++    fn new(callback_params: &str, wrapper_before: &str, params: &str) -> Self {
++        Self {
++            callback_params: callback_params.to_owned(),
++            return_type: "()".to_owned(),
++            wrapper_before: wrapper_before.to_owned(),
++            wrapper_after: "".to_owned(),
++            params: params.to_owned(),
++        }
++    }
++}
++
++fn get_rtnl_links_values(name: &str, netdevice: &str) -> RtnlLinkValues {
++    let setup_dev = format!(
++        "let mut dev = kernel::net::device::NetDevice::<{}>::from_pointer(dev);",
++        netdevice
++    );
++    match name {
++        "setup" => RtnlLinkValues::new("dev: *mut kernel::bindings::net_device", &setup_dev, "&mut dev"),
++        "validate" => RtnlLinkValues {
++            callback_params: "tb: *mut *mut kernel::bindings::nlattr, data: *mut *mut kernel::bindings::nlattr, extack: *mut kernel::bindings::netlink_ext_ack".to_owned(),
++            return_type: "kernel::c_types::c_int".to_owned(),
++            wrapper_before: r#"kernel::from_kernel_result! {
++                 let tb = kernel::net::netlink::NlAttrVec::from_pointer(tb as *const *const kernel::bindings::nlattr);
++                 let data = kernel::net::netlink::NlAttrVec::from_pointer(data as *const *const kernel::bindings::nlattr);
++                 let extack = kernel::net::netlink::NlExtAck::from_pointer(extack);
++                 "#.to_owned(),
++            wrapper_after: "?; Ok(0) }".to_owned(),
++            params: "&tb, &data, &extack".to_owned(),
++        },
++        _ => panic!("invalid rtnl_link_ops function '{}'", name),
++    }
++}
++
++fn build_rtnl_links_callback(name: &str, netdevice: &str, func: &str, kind: &str) -> String {
++    let values = get_rtnl_links_values(name, netdevice);
++    format!(
++        r#"
++             #[doc(hidden)]
++             pub unsafe extern "C" fn __rtnl_link_{name}_callback_{kind}({cb_params}) -> {cb_return} {{
++                 {cb_before}
++                 {cb_func}({cb_r_params})
++                 {cb_after}
++             }}
++         "#,
++        name = name,
++        kind = kind,
++        cb_params = values.callback_params,
++        cb_return = values.return_type,
++        cb_before = values.wrapper_before,
++        cb_func = func,
++        cb_r_params = values.params,
++        cb_after = values.wrapper_after,
++    )
++}
+-- 
+2.38.2
+
