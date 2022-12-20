@@ -35,7 +35,8 @@ com dev="/dev/ttyUSB0":
 
 # send the given module to through zmodem, Default: /dev/ttyUSB0
 @send module tty="/dev/ttyUSB0" :
-    sz --zmodem "modules/{{module}}/{{module}}.ko" 1> {{tty}} 0< {{tty}}
+    sz -y --zmodem "modules/{{module}}/{{module}}.ko" 1> {{tty}} 0< {{tty}}
+    md5sum "modules/{{module}}/{{module}}.ko"
 # 
 # qemu:
 #     qemu-system-arm -nographic -kernel linux/vmlinux -initrd busybox/initrd.img -nic user,model=rtl8139,hostfwd=tcp::5555-:23 -machine virt
