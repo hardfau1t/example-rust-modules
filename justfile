@@ -75,7 +75,7 @@ init:
     git clone https://github.com/Rust-for-Linux/linux.git --depth 1 linux
     git -C linux checkout bd1234712693
     cd linux && git am ../patches
-    cd linux && rustup override set $(scripts/min-tool-version.sh rustc)
+    cd linux && rustup override set $(scripts/min-tool-version.sh rustc) && rustup component add rust-src
     cd linux && cargo install --locked --version $(scripts/min-tool-version.sh bindgen) bindgen
     just beagle-config
     just kernel
