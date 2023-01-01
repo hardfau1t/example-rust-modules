@@ -7,3 +7,4 @@
 *.order
 rust-project.json
 /linux/
+/snull/
