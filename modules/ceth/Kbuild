@@ -1,0 +1,2 @@
+obj-m := ceth.o
+ceth-y := cpsw.o cpsw_priv.o cpsw_ale.o cpsw_sl.o cpsw_ethtool.c

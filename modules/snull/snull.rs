@@ -6,7 +6,7 @@
 use core::slice;
 
 use kernel::bindings::{ethhdr, iphdr, netif_rx, skb_clone};
-use kernel::net::device::{Flag, NetdevTX};
+use kernel::net::device::{Flag, NetdevTX, Features};
 use kernel::net::prelude::{EthToolOps, NetDevice, NetDeviceAdapter, NetDeviceOps, SkBuff};
 use kernel::net::rtnl_link_ops;
 use kernel::prelude::*;
@@ -22,13 +22,15 @@ module! {
 
 /// updates the buffer so that it can be retransmitted on the same port
 fn update_skb(skb: &mut SkBuff, dev: *const kernel::bindings::net_device) {
-    let buf = skb.get_internal().data;
     let eth_hdr_size = core::mem::size_of::<ethhdr>();
-    let ip_hdr = &mut unsafe { *(buf.add(eth_hdr_size) as *mut iphdr) };
+    let buf = unsafe{skb.get_internal().data.add(eth_hdr_size)};
+    let ip_hdr = &mut unsafe { *(buf as *mut iphdr) };
+    let calc_check = unsafe{kernel::bindings::ip_fast_csum(buf as *const core::ffi::c_void, skb.get_internal().len)};
     ip_hdr.saddr ^= 1 << 16;
     ip_hdr.daddr ^= 1 << 16;
-    ip_hdr.check = 0;
-    //TODO: Update checksum
+    let updated_check = unsafe{kernel::bindings::ip_fast_csum(buf as *const core::ffi::c_void, skb.get_internal().len)};
+    pr_info!("Original Checksum {}, Calculated {}, Updated {}\n", ip_hdr.check, calc_check, updated_check);
+    ip_hdr.check = updated_check;
     unsafe{(&mut *(skb.get_pointer() as *mut kernel::bindings::sk_buff)).__bindgen_anon_1.__bindgen_anon_1.__bindgen_anon_1.dev = dev as *mut _};
 }
 
@@ -97,6 +99,8 @@ impl NetDeviceAdapter for SnullPriv {
         dev.ether_setup();
         dev.set_ops();
         dev.add_flag(Flag::NOARP); // snull doesn't supports ARP
+                                   //
+        // dev.set_features(Features);
         dev.remove_flag(Flag::MULTICAST);
         dev.hw_addr_random();
         // pr_info!("Snull setup done\n");

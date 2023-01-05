@@ -51,10 +51,14 @@ beagle-config:
     make  {{makeflags}} allnoconfig multi_v7_defconfig rustavailable rust.config
 
 install-modules:
-    sudo -E make {{makeflags}} INSTALL_MOD_PATH=/mnt/ modules_install
+    # sudo -E make {{makeflags}} INSTALL_MOD_PATH=/mnt/ modules_install
+    mkdir -p /tmp/mods/
+    make {{makeflags}} INSTALL_MOD_PATH=/tmp/mods modules_install
+    scp -r /tmp/mods beagle:mods
 
 install-kernel:
-    sudo cp ./linux/arch/arm/boot/{zImage,dts/am335x-boneblack.dtb} /mnt/boot
+    # sudo cp ./linux/arch/arm/boot/{zImage,dts/am335x-boneblack.dtb} /mnt/boot
+    scp ./linux/arch/arm/boot/{zImage,dts/am335x-boneblack.dtb} beagle:/home/gireesh/boot
 
 install-tools:
     sudo cp ./linux/tools/gpio/{gpio-event-mon,gpio-hammer,gpio-watch,lsgpio} /mnt/bin
