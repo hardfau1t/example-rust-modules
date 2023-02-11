@@ -35,8 +35,9 @@ com dev="/dev/ttyUSB0":
 
 # send the given module to through zmodem, Default: /dev/ttyUSB0
 @send module tty="/dev/ttyUSB0" :
-    sz -y --zmodem "modules/{{module}}/{{module}}.ko" 1> {{tty}} 0< {{tty}}
-    md5sum "modules/{{module}}/{{module}}.ko"
+    # sz -y --zmodem "modules/{{module}}/{{module}}.ko" 1> {{tty}} 0< {{tty}}
+    # md5sum "modules/{{module}}/{{module}}.ko"
+    scp "modules/{{module}}/{{module}}.ko" beagle:{{module}}.ko
 # 
 # qemu:
 #     qemu-system-arm -nographic -kernel linux/vmlinux -initrd busybox/initrd.img -nic user,model=rtl8139,hostfwd=tcp::5555-:23 -machine virt
@@ -54,11 +55,19 @@ install-modules:
     # sudo -E make {{makeflags}} INSTALL_MOD_PATH=/mnt/ modules_install
     mkdir -p /tmp/mods/
     make {{makeflags}} INSTALL_MOD_PATH=/tmp/mods modules_install
-    scp -r /tmp/mods beagle:mods
+    ssh -t beagle "bash -c 'rm -rf ~/mods/*'"
+    cd /tmp/mods/lib/modules&& tar -cvzf mods.tar.gz * && scp mods.tar.gz beagle:mods
+    rm -rf /tmp/mods
+    ssh -t beagle 'bash -c "rm -rf /lib/modules/*"'
+    ssh -t beagle 'bash -c "tar -C /lib/modules/ -xvf mods"'
+    ssh -t beagle 'bash -c "rm -rf /lib/modules/*/kernel/drivers/net/ethernet/ti"'
 
 install-kernel:
     # sudo cp ./linux/arch/arm/boot/{zImage,dts/am335x-boneblack.dtb} /mnt/boot
-    scp ./linux/arch/arm/boot/{zImage,dts/am335x-boneblack.dtb} beagle:/home/gireesh/boot
+    ssh -t beagle "bash -c 'rm -rf ~/boot/*'"
+    scp ./linux/arch/arm/boot/zImage beagle:/boot/vmlinuz-6.1.0-rc1+
+    scp ./linux/arch/arm/boot/dts/am335x-boneblack.dtb beagle:/boot/
+
 
 install-tools:
     sudo cp ./linux/tools/gpio/{gpio-event-mon,gpio-hammer,gpio-watch,lsgpio} /mnt/bin
