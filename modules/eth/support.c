@@ -1837,11 +1837,10 @@ static const struct soc_device_attribute cpsw_soc_devices[] = {
 	{ /* sentinel */ }
 };
 
-int cpsw_probe(struct platform_device *pdev)
+int cpsw_probe(struct cpsw_common *cpsw)
 {
 	// const struct soc_device_attribute *soc;
-	struct device *dev = &pdev->dev;
-	struct cpsw_common *cpsw;
+	struct device *dev = cpsw->dev;
 	struct resource *ss_res;
 	struct gpio_descs *mode;
 	void __iomem *ss_regs;
@@ -1849,13 +1848,7 @@ int cpsw_probe(struct platform_device *pdev)
 	struct clk *clk;
 	int irq;
 
-	cpsw = devm_kzalloc(dev, sizeof(struct cpsw_common), GFP_KERNEL);
-	if (!cpsw)
-		return -ENOMEM;
-
 	cpsw_slave_index = cpsw_slave_index_priv;
-
-	cpsw->dev = dev;
 
 	cpsw->slaves = devm_kcalloc(dev,
 				    CPSW_SLAVE_PORTS_NUM,
@@ -1879,7 +1872,7 @@ int cpsw_probe(struct platform_device *pdev)
 	}
 	cpsw->bus_freq_mhz = clk_get_rate(clk) / 1000000;
 
-	ss_regs = devm_platform_get_and_ioremap_resource(pdev, 0, &ss_res);
+	/* ss_regs = devm_platform_get_and_ioremap_resource(pdev, 0, &ss_res);
 	if (IS_ERR(ss_regs)) {
 		ret = PTR_ERR(ss_regs);
 		return ret;
@@ -1899,9 +1892,8 @@ int cpsw_probe(struct platform_device *pdev)
 	irq = platform_get_irq_byname(pdev, "misc");
 	if (irq <= 0)
 		return irq;
-	cpsw->misc_irq = irq;
+	cpsw->misc_irq = irq; */
 
-	platform_set_drvdata(pdev, cpsw);
 	/* This may be required here for child devices. */
 	pm_runtime_enable(dev);
 
@@ -1983,7 +1975,7 @@ int cpsw_probe(struct platform_device *pdev)
 		goto skip_cpts;
 
 	ret = devm_request_irq(dev, cpsw->misc_irq, cpsw_misc_interrupt,
-			       0, dev_name(&pdev->dev), cpsw);
+			       0, dev_name(cpsw->dev), cpsw);
 	if (ret < 0) {
 		dev_err(dev, "error attaching misc irq (%d)\n", ret);
 		goto clean_unregister_netdev;
@@ -2029,12 +2021,11 @@ clean_dt_ret:
 	return ret;
 }
 
-int cpsw_remove(struct platform_device *pdev)
+int cpsw_remove(struct cpsw_common *cpsw )
 {
-	struct cpsw_common *cpsw = platform_get_drvdata(pdev);
 	int ret;
 
-	ret = pm_runtime_resume_and_get(&pdev->dev);
+	ret = pm_runtime_resume_and_get(cpsw->dev);
 	if (ret < 0)
 		return ret;
 
@@ -2045,8 +2036,8 @@ int cpsw_remove(struct platform_device *pdev)
 	cpts_release(cpsw->cpts);
 	cpdma_ctlr_destroy(cpsw->dma);
 	cpsw_remove_dt(cpsw);
-	pm_runtime_put_sync(&pdev->dev);
-	pm_runtime_disable(&pdev->dev);
+	pm_runtime_put_sync(cpsw->dev);
+	pm_runtime_disable(cpsw->dev);
 	return 0;
 }
 

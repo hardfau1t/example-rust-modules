@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
 
 //! Broadcom BCM2835 Random Number Generator support.
+use core::marker::{Send, Sync};
 
-use core::marker::Sync;
+use kernel::{
+    c_str, device::RawDevice, driver::DeviceRemoval, module_platform_driver, of, platform,
+    prelude::*,
+};
 
-use kernel::{driver::DeviceRemoval, module_platform_driver, of, platform, prelude::*, sync::Arc};
+mod binds;
 
 module_platform_driver! {
     type: CpswDriver,
@@ -14,14 +18,9 @@ module_platform_driver! {
     license: "GPL v2",
 }
 
-extern "C" {
-    fn cpsw_probe(ptr: *mut kernel::bindings::platform_device) -> i32;
-    fn cpsw_remove(ptr: *mut kernel::bindings::platform_device) -> i32;
-}
-
 /// cpsw platform data
 struct CpswPlatData {
-    pdev: *mut kernel::bindings::platform_device,
+    cpsw: binds::cpsw_common,
 }
 
 impl DeviceRemoval for CpswPlatData {
@@ -31,7 +30,6 @@ impl DeviceRemoval for CpswPlatData {
 }
 
 unsafe impl Sync for CpswPlatData {}
-
 unsafe impl Send for CpswPlatData {}
 
 struct CpswDriver;
@@ -42,18 +40,21 @@ impl platform::Driver for CpswDriver {
     fn probe(
         dev: &mut platform::Device,
         _id_info: Option<&Self::IdInfo>,
-    ) -> Result<Arc<CpswPlatData>> {
-        unsafe { cpsw_probe(dev.inne()) };
-        Arc::try_new(CpswPlatData { pdev: dev.inne() })
+    ) -> Result<Box<CpswPlatData>> {
+        dev.pr_info(format_args!("probing cpsw device"));
+        let mut cpsw = binds::cpsw_common::default();
+        cpsw.dev = dev.raw_device();
+        cpsw.irqs_table[0] = dev.platform_get_irq_byname(c_str!("rx")) as u32;
+        Ok(Box::try_new(CpswPlatData { cpsw })?)
     }
 
-    fn remove(data: &Self::Data) -> Result {
+    fn remove(_data: &Self::Data) -> Result {
         pr_info!("platform driver removal requested\n");
         // unsafe { cpsw_remove(data.pdev) };
         core::result::Result::Ok(())
     }
 
-    type Data = Arc<CpswPlatData>;
+    type Data = Box<CpswPlatData>;
 
     type IdInfo = ();
 }
