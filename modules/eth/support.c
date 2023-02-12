@@ -836,7 +836,7 @@ static int cpsw_ndo_open(struct net_device *ndev)
 	/* Notify the stack of the actual queue counts. */
 	ret = netif_set_real_num_tx_queues(ndev, cpsw->tx_ch_num);
 	if (ret) {
-		dev_err(priv->dev, "cannot set real number of tx queues\n");
+		dev_err(priv->dev, "cannot set real number of tx queues: ch_num: %d, ndev: %p\n", cpsw->tx_ch_num, ndev);
 		goto pm_cleanup;
 	}
 
@@ -1837,16 +1837,13 @@ static const struct soc_device_attribute cpsw_soc_devices[] = {
 	{ /* sentinel */ }
 };
 
-int cpsw_probe(struct cpsw_common *cpsw)
+int cpsw_probe(struct cpsw_common *cpsw, struct resource *ss_res)
 {
-	// const struct soc_device_attribute *soc;
+	const struct soc_device_attribute *soc;
 	struct device *dev = cpsw->dev;
-	struct resource *ss_res;
 	struct gpio_descs *mode;
-	void __iomem *ss_regs;
 	int ret = 0, ch;
 	struct clk *clk;
-	int irq;
 
 	cpsw_slave_index = cpsw_slave_index_priv;
 
@@ -1872,27 +1869,6 @@ int cpsw_probe(struct cpsw_common *cpsw)
 	}
 	cpsw->bus_freq_mhz = clk_get_rate(clk) / 1000000;
 
-	/* ss_regs = devm_platform_get_and_ioremap_resource(pdev, 0, &ss_res);
-	if (IS_ERR(ss_regs)) {
-		ret = PTR_ERR(ss_regs);
-		return ret;
-	}
-	cpsw->regs = ss_regs;
-
-	irq = platform_get_irq_byname(pdev, "rx");
-	if (irq < 0)
-		return irq;
-	cpsw->irqs_table[0] = irq;
-
-	irq = platform_get_irq_byname(pdev, "tx");
-	if (irq < 0)
-		return irq;
-	cpsw->irqs_table[1] = irq;
-
-	irq = platform_get_irq_byname(pdev, "misc");
-	if (irq <= 0)
-		return irq;
-	cpsw->misc_irq = irq; */
 
 	/* This may be required here for child devices. */
 	pm_runtime_enable(dev);
@@ -1910,23 +1886,23 @@ int cpsw_probe(struct cpsw_common *cpsw)
 	if (ret)
 		goto clean_dt_ret;
 
-	// soc = soc_device_match(cpsw_soc_devices);
-	// if (soc)
-		// cpsw->quirk_irq = true;
+	soc = soc_device_match(cpsw_soc_devices);
+	if (soc)
+		cpsw->quirk_irq = true;
 
 	cpsw->rx_packet_max = rx_packet_max;
 	cpsw->descs_pool_size = descs_pool_size;
 	eth_random_addr(cpsw->base_mac);
 
-	ret = cpsw_init_common(cpsw, ss_regs, ale_ageout,
+	ret = cpsw_init_common(cpsw, cpsw->regs, ale_ageout,
 			       (u32 __force)ss_res->start + CPSW2_BD_OFFSET,
 			       descs_pool_size);
 	if (ret)
 		goto clean_dt_ret;
 
 	cpsw->wr_regs = cpsw->version == CPSW_VERSION_1 ?
-			ss_regs + CPSW1_WR_OFFSET :
-			ss_regs + CPSW2_WR_OFFSET;
+			(void*)cpsw->regs + CPSW1_WR_OFFSET :
+			(void*)cpsw->regs + CPSW2_WR_OFFSET;
 
 	ch = cpsw->quirk_irq ? 0 : 7;
 	cpsw->txv[0].ch = cpdma_chan_create(cpsw->dma, ch, cpsw_tx_handler, 0);

@@ -3581,3 +3581,10 @@ pub(crate) struct cpts {
     _unused: [u8; 0],
 }
 pub(crate) const CPSW_CPDMA: core::ffi::c_int = 1;
+
+//========================================================
+//====================custom==============================
+extern "C" {
+    pub(crate) fn cpsw_probe(cpsw: *mut cpsw_common, ss_res: *mut kernel::bindings::resource )->core::ffi::c_int;
+    pub(crate) fn cpsw_remove(cpsw: *const cpsw_common)->core::ffi::c_int;
+}

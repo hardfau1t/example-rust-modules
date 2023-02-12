@@ -38,19 +38,30 @@ impl platform::Driver for CpswDriver {
             (of::DeviceId::Compatible(b"ti,cpsw-switch"), None),
     ]}
     fn probe(
-        dev: &mut platform::Device,
+        pdev: &mut platform::Device,
         _id_info: Option<&Self::IdInfo>,
     ) -> Result<Box<CpswPlatData>> {
-        dev.pr_info(format_args!("probing cpsw device"));
-        let mut cpsw = binds::cpsw_common::default();
-        cpsw.dev = dev.raw_device();
-        cpsw.irqs_table[0] = dev.platform_get_irq_byname(c_str!("rx")) as u32;
-        Ok(Box::try_new(CpswPlatData { cpsw })?)
+        pdev.pr_info(format_args!("probing cpsw device"));
+        let mut data = Box::try_new(CpswPlatData { cpsw: binds::cpsw_common::default() })?;
+        data.cpsw.dev = pdev.raw_device();
+        let mut ss_res: *mut kernel::bindings::resource = core::ptr::null_mut();
+        data.cpsw.regs = pdev.devm_platform_get_and_ioremap_resource(0, &mut ss_res)?
+            as *mut binds::cpsw_ss_regs;
+        data.cpsw.irqs_table[0] = pdev.platform_get_irq_byname(c_str!("rx"))? as u32;
+        data.cpsw.irqs_table[1] = pdev.platform_get_irq_byname(c_str!("tx"))? as u32;
+        data.cpsw.misc_irq = pdev.platform_get_irq_byname(c_str!("misc"))?;
+        let ret = unsafe { binds::cpsw_probe(&mut data.cpsw as *mut _, ss_res) };
+        if ret == 0 {
+            pdev.pr_info(format_args!("probing cpsw successfull"));
+            Ok(data)
+        } else {
+            Err(kernel::error::code::EAGAIN)
+        }
     }
 
-    fn remove(_data: &Self::Data) -> Result {
+    fn remove(data: &Self::Data) -> Result {
         pr_info!("platform driver removal requested\n");
-        // unsafe { cpsw_remove(data.pdev) };
+        unsafe { binds::cpsw_remove(&data.cpsw as *const _) };
         core::result::Result::Ok(())
     }
 
