@@ -10,7 +10,7 @@ makeflags := '-C ' + kernel_dir
 
 # builds specific module <name of the directory>
 build module="gdev":
-    make {{makeflags}} M="$PWD/modules/{{module}}" modules
+    compiledb make {{makeflags}} M="$PWD/modules/{{module}}" modules
 
 clean module="gdev":
 	make {{makeflags}} M="$PWD/modules/{{module}}" clean

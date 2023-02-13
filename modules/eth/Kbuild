@@ -1,2 +1,3 @@
+ccflags-y := -Wall
 obj-m := eth.o
-eth-y := reth.o binds.o support.o my_cpsw_switchdev.o my_davinci_cpdma.o my_cpsw_ale.o my_cpsw_sl.o my_cpsw_priv.o my_cpsw_ethtool.o my_cpsw-common.o
+eth-y := reth.o binds.o support.o
