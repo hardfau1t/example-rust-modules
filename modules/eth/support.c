@@ -1765,11 +1765,10 @@ int cpsw_get_coalesce(struct net_device* ndev,
     return 0;
 }
 
-int cpsw_set_coalesce(struct net_device* ndev,
+int cpsw_set_coalesce(struct cpsw_priv* priv ,
                       struct ethtool_coalesce* coal,
                       struct kernel_ethtool_coalesce* kernel_coal,
                       struct netlink_ext_ack* extack) {
-    struct cpsw_priv* priv = netdev_priv(ndev);
     u32 int_ctrl;
     u32 num_interrupts = 0;
     u32 prescale = 0;
@@ -2317,7 +2316,6 @@ int cpsw_get_ts_info(struct net_device* ndev, struct ethtool_ts_info* info) {
 }
 #endif
 
-int (*cpsw_slave_index)(struct cpsw_common* cpsw, struct cpsw_priv* priv);
 
 void cpsw_intr_enable(struct cpsw_common* cpsw) {
     writel_relaxed(0xFF, &cpsw->wr_regs->tx_en);
@@ -2340,7 +2338,6 @@ void cpsw_tx_handler(void* token, int len, int status) {
     struct netdev_queue* txq;
     struct sk_buff* skb;
     int ch;
-
     if (cpsw_is_xdpf_handle(token)) {
         xdpf = cpsw_handle_to_xdpf(token);
         xmeta = (void*)xdpf + CPSW_XMETA_OFFSET;
@@ -5518,30 +5515,37 @@ static int cpdma_chan_submit_si(struct submit_info* si) {
     dma_addr_t buffer;
     u32 mode;
     int ret;
-
+    // pr_info("Debug1\n");
     if (chan->count >= chan->desc_num) {
         chan->stats.desc_alloc_fail++;
         return -ENOMEM;
     }
 
+    // pr_info("Debug2\n");
     desc = cpdma_desc_alloc(ctlr->pool);
     if (!desc) {
         chan->stats.desc_alloc_fail++;
         return -ENOMEM;
     }
 
+    // pr_info("Debug3\n");
     if (len < ctlr->params.min_packet_size) {
         len = ctlr->params.min_packet_size;
         chan->stats.runt_transmit_buff++;
     }
+    // pr_info("Debug4\n");
 
     mode = CPDMA_DESC_OWNER | CPDMA_DESC_SOP | CPDMA_DESC_EOP;
+    // pr_info("Debug5\n");
     cpdma_desc_to_port(chan, mode, si->directed);
+    // pr_info("Debug6\n");
 
     if (si->data_dma) {
+    // pr_info("Debug7\n");
         buffer = si->data_dma;
         dma_sync_single_for_device(ctlr->dev, buffer, len, chan->dir);
     } else {
+    // pr_info("Debug8\n");
         buffer = dma_map_single(ctlr->dev, si->data_virt, len, chan->dir);
         ret = dma_mapping_error(ctlr->dev, buffer);
         if (ret) {
@@ -5549,16 +5553,23 @@ static int cpdma_chan_submit_si(struct submit_info* si) {
             return -EINVAL;
         }
     }
+    // pr_info("Debug9\n");
 
     /* Relaxed IO accessors can be used here as there is read barrier
      * at the end of write sequence.
      */
     writel_relaxed(0, &desc->hw_next);
+    // pr_info("Debug10\n");
     writel_relaxed(buffer, &desc->hw_buffer);
+    // pr_info("Debug11\n");
     writel_relaxed(len, &desc->hw_len);
+    // pr_info("Debug12\n");
     writel_relaxed(mode | len, &desc->hw_mode);
+    // pr_info("Debug13\n");
     writel_relaxed((uintptr_t)si->token, &desc->sw_token);
+    // pr_info("Debug14\n");
     writel_relaxed(buffer, &desc->sw_buffer);
+    // pr_info("Debug15\n");
     writel_relaxed(si->data_dma ? len | CPDMA_DMA_EXT_MAP : len, &desc->sw_len);
     desc_read(desc, sw_len);
 
@@ -5936,10 +5947,6 @@ int cpdma_set_num_rx_descs(struct cpdma_ctlr* ctlr, int num_rx_desc) {
 
 // May not be required
 
-static int debug_level;
-static int ale_ageout = CPSW_ALE_AGEOUT_DEFAULT;
-static int rx_packet_max = CPSW_MAX_PACKET_SIZE;
-static int descs_pool_size = CPSW_CPDMA_DESCS_POOL_SIZE_DEFAULT;
 
 struct cpsw_devlink {
     struct cpsw_common* cpsw;
@@ -5954,7 +5961,7 @@ enum cpsw_devlink_param_id {
 /* struct cpsw_common is not needed, kept here for compatibility
  * reasons witrh the old driver
  */
-static int cpsw_slave_index_priv(struct cpsw_common* cpsw,
+int cpsw_slave_index (struct cpsw_common* cpsw,
                                  struct cpsw_priv* priv) {
     if (priv->emac_port == HOST_PORT_NUM)
         return -1;
@@ -6042,7 +6049,7 @@ static unsigned int cpsw_rxbuf_total_len(unsigned int len) {
     return SKB_DATA_ALIGN(len);
 }
 
-static void cpsw_rx_handler(void* token, int len, int status) {
+void cpsw_rx_handler(void* token, int len, int status) {
     struct page *new_page, *page = token;
     void* pa = page_address(page);
     int headroom = CPSW_HEADROOM_NA;
@@ -6519,7 +6526,7 @@ static void cpsw_slave_open(struct cpsw_slave* slave, struct cpsw_priv* priv) {
                      slave->data->phy_if);
 }
 
-static int cpsw_ndo_stop(struct net_device* ndev) {
+int cpsw_ndo_stop(struct net_device* ndev) {
     struct cpsw_priv* priv = netdev_priv(ndev);
     struct cpsw_common* cpsw = priv->cpsw;
     struct cpsw_slave* slave;
@@ -6556,7 +6563,7 @@ static int cpsw_ndo_stop(struct net_device* ndev) {
     return 0;
 }
 
-static int cpsw_ndo_open(struct net_device* ndev) {
+int cpsw_ndo_open(struct net_device* ndev) {
     struct cpsw_priv* priv = netdev_priv(ndev);
     struct cpsw_common* cpsw = priv->cpsw;
     int ret;
@@ -6628,7 +6635,7 @@ static int cpsw_ndo_open(struct net_device* ndev) {
         struct ethtool_coalesce coal;
 
         coal.rx_coalesce_usecs = cpsw->coal_intvl;
-        cpsw_set_coalesce(ndev, &coal, NULL, NULL);
+        cpsw_set_coalesce(priv, &coal, NULL, NULL);
     }
 
     cpdma_ctlr_start(cpsw->dma);
@@ -6645,7 +6652,7 @@ pm_cleanup:
     return ret;
 }
 
-static netdev_tx_t cpsw_ndo_start_xmit(struct sk_buff* skb,
+netdev_tx_t cpsw_ndo_start_xmit(struct sk_buff* skb,
                                        struct net_device* ndev) {
     struct cpsw_priv* priv = netdev_priv(ndev);
     struct cpsw_common* cpsw = priv->cpsw;
@@ -6703,37 +6710,66 @@ fail:
 
     return NETDEV_TX_BUSY;
 }
+// netdev_tx_t cpsw_ndo_start_xmit(struct sk_buff* skb,
+//                                        const struct cpsw_priv* priv,
+//                                        struct netdev_queue* txq) {
+//     struct cpsw_common* cpsw = priv->cpsw;
+//     struct cpts* cpts = cpsw->cpts;
+//     struct cpdma_chan* txch;
+//     int ret, q_idx;
 
-static int cpsw_ndo_set_mac_address(struct net_device* ndev, void* p) {
-    struct sockaddr* addr = (struct sockaddr*)p;
-    struct cpsw_priv* priv = netdev_priv(ndev);
-    struct cpsw_common* cpsw = priv->cpsw;
-    int ret, slave_no;
-    int flags = 0;
-    u16 vid = 0;
+//     if (skb_put_padto(skb, READ_ONCE(priv->tx_packet_min))) {
+//         cpsw_err(priv, tx_err, "packet pad failed\n");
+//         // TODO
+//         // ndev->stats.tx_dropped++;
+//         return NET_XMIT_DROP;
+//     }
 
-    slave_no = cpsw_slave_index(cpsw, priv);
-    if (!is_valid_ether_addr(addr->sa_data))
-        return -EADDRNOTAVAIL;
+//     // can be ignored considering cpts is inactive
+//     if (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP && priv->tx_ts_enabled &&
+//         cpts_can_timestamp(cpts, skb))
+//         skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
 
-    ret = pm_runtime_resume_and_get(cpsw->dev);
-    if (ret < 0)
-        return ret;
+//     q_idx = skb_get_queue_mapping(skb);
+//     if (q_idx >= cpsw->tx_ch_num)
+//         q_idx = q_idx % cpsw->tx_ch_num;
 
-    vid = cpsw->slaves[slave_no].port_vlan;
-    flags = ALE_VLAN | ALE_SECURE;
+//     txch = cpsw->txv[q_idx].ch;
+//     // txq = netdev_get_tx_queue(ndev, q_idx);
+//     skb_tx_timestamp(skb);
+//     ret = cpdma_chan_submit(txch, skb, skb->data, skb->len, priv->emac_port);
+//     if (unlikely(ret != 0)) {
+//         cpsw_err(priv, tx_err, "desc submit failed\n");
+//         goto fail;
+//     }
 
-    cpsw_ale_del_ucast(cpsw->ale, priv->mac_addr, HOST_PORT_NUM, flags, vid);
-    cpsw_ale_add_ucast(cpsw->ale, addr->sa_data, HOST_PORT_NUM, flags, vid);
+//     /* If there is no more tx desc left free then we need to
+//      * tell the kernel to stop sending us tx frames.
+//      */
+//     if (unlikely(!cpdma_check_free_tx_desc(txch))) {
+//         netif_tx_stop_queue(txq);
 
-    ether_addr_copy(priv->mac_addr, addr->sa_data);
-    eth_hw_addr_set(ndev, priv->mac_addr);
-    cpsw_set_slave_mac(&cpsw->slaves[slave_no], priv);
+//         /* Barrier, so that stop_queue visible to other cpus */
+//         smp_mb__after_atomic();
 
-    pm_runtime_put(cpsw->dev);
+//         if (cpdma_check_free_tx_desc(txch))
+//             netif_tx_wake_queue(txq);
+//     }
 
-    return 0;
-}
+//     return NETDEV_TX_OK;
+// fail:
+//     // ndev->stats.tx_dropped++;
+//     netif_tx_stop_queue(txq);
+
+//     /* Barrier, so that stop_queue visible to other cpus */
+//     smp_mb__after_atomic();
+
+//     if (cpdma_check_free_tx_desc(txch))
+//         netif_tx_wake_queue(txq);
+
+//     return NETDEV_TX_BUSY;
+// }
+
 
 static int cpsw_ndo_vlan_rx_kill_vid(struct net_device* ndev,
                                      __be16 proto,
@@ -6784,18 +6820,17 @@ err:
     pm_runtime_put(cpsw->dev);
     return ret;
 }
-
 static const struct net_device_ops cpsw_netdev_ops = {
     .ndo_open = cpsw_ndo_open,
     .ndo_stop = cpsw_ndo_stop,
     .ndo_start_xmit = cpsw_ndo_start_xmit,
-    .ndo_set_mac_address = cpsw_ndo_set_mac_address,
+    // .ndo_set_mac_address = cpsw_ndo_set_mac_address,
     .ndo_vlan_rx_kill_vid = cpsw_ndo_vlan_rx_kill_vid,
     .ndo_vlan_rx_add_vid = cpsw_ndo_vlan_rx_add_vid,
 };
 
 
-static int cpsw_probe_dt(struct cpsw_common* cpsw) {
+int cpsw_probe_dt(struct cpsw_common* cpsw) {
     struct device_node *node = cpsw->dev->of_node, *tmp_node, *port_np;
     struct cpsw_platform_data* data = &cpsw->data;
     struct device* dev = cpsw->dev;
@@ -6932,7 +6967,7 @@ static void cpsw_remove_dt(struct cpsw_common* cpsw) {
     }
 }
 
-static int cpsw_create_ports(struct cpsw_common* cpsw) {
+int cpsw_create_ports(struct cpsw_common* cpsw) {
     struct cpsw_platform_data* data = &cpsw->data;
     struct net_device *ndev, *napi_ndev = NULL;
     struct device* dev = cpsw->dev;
@@ -6955,7 +6990,7 @@ static int cpsw_create_ports(struct cpsw_common* cpsw) {
         priv->cpsw = cpsw;
         priv->ndev = ndev;
         priv->dev = dev;
-        priv->msg_enable = netif_msg_init(debug_level, CPSW_DEBUG);
+        priv->msg_enable = netif_msg_init(0, CPSW_DEBUG); // disable debug output
         priv->emac_port = i + 1;
         priv->tx_packet_min = CPSW_MIN_PACKET_SIZE;
 
@@ -6971,9 +7006,8 @@ static int cpsw_create_ports(struct cpsw_common* cpsw) {
 
         cpsw->slaves[i].ndev = ndev;
 
-        ndev->features |= NETIF_F_HW_VLAN_CTAG_FILTER |
-                          NETIF_F_HW_VLAN_CTAG_RX | NETIF_F_NETNS_LOCAL |
-                          NETIF_F_HW_TC;
+    // ndev->features |= NETIF_F_HW_VLAN_CTAG_FILTER | NETIF_F_HW_VLAN_CTAG_RX |
+    //                   NETIF_F_NETNS_LOCAL | NETIF_F_HW_TC;
 
         ndev->netdev_ops = &cpsw_netdev_ops;
         // ndev->ethtool_ops = &cpsw_ethtool_ops;
@@ -7008,7 +7042,7 @@ static void cpsw_unregister_ports(struct cpsw_common* cpsw) {
     }
 }
 
-static int cpsw_register_ports(struct cpsw_common* cpsw) {
+int cpsw_register_ports(struct cpsw_common* cpsw) {
     int ret = 0, i = 0;
 
     for (i = 0; i < cpsw->data.slaves; i++) {
@@ -7039,144 +7073,65 @@ bool cpsw_port_dev_check(const struct net_device* ndev) {
     return false;
 }
 
-int cpsw_probe(struct cpsw_common* cpsw, struct resource* ss_res) {
-    struct device* dev = cpsw->dev;
-    int ret = 0;
-    struct clk* clk;
+// int cpsw_probe(struct cpsw_common* cpsw, struct resource* ss_res) {
+//     struct device* dev = cpsw->dev;
+//     int ret = 0;
 
-    cpsw_slave_index = cpsw_slave_index_priv;
 
-    cpsw->slaves = devm_kcalloc(dev, CPSW_SLAVE_PORTS_NUM,
-                                sizeof(struct cpsw_slave), GFP_KERNEL);
-    if (!cpsw->slaves)
-        return -ENOMEM;
+//     /* This may be required here for child devices. */
+//     pm_runtime_enable(dev);
 
-    clk = devm_clk_get(dev, "fck");
-    if (IS_ERR(clk)) {
-        ret = PTR_ERR(clk);
-        dev_err(dev, "fck is not found %d\n", ret);
-        return ret;
-    }
-    cpsw->bus_freq_mhz = clk_get_rate(clk) / 1000000;
+//     /* Need to enable clocks with runtime PM api to access module
+//      * registers
+//      */
+//     // ret = pm_runtime_resume_and_get(dev);
+//     // if (ret < 0) {
+//     //     pm_runtime_disable(dev);
+//     //     return ret;
+//     // }
 
-    /* This may be required here for child devices. */
-    pm_runtime_enable(dev);
 
-    /* Need to enable clocks with runtime PM api to access module
-     * registers
-     */
-    ret = pm_runtime_resume_and_get(dev);
-    if (ret < 0) {
-        pm_runtime_disable(dev);
-        return ret;
-    }
+//     /* if (!cpsw->cpts)
+//         goto skip_cpts;
 
-    ret = cpsw_probe_dt(cpsw);
-    if (ret)
-        goto clean_dt_ret;
+//     ret = devm_request_irq(dev, cpsw->misc_irq, cpsw_misc_interrupt, 0,
+//                            dev_name(cpsw->dev), cpsw);
+//     if (ret < 0) {
+//         dev_err(dev, "error attaching misc irq (%d)\n", ret);
+//         goto clean_unregister_netdev;
+//     }
+// */
 
-    cpsw->rx_packet_max = rx_packet_max;
-    cpsw->descs_pool_size = descs_pool_size;
-    eth_random_addr(cpsw->base_mac);
+// // skip_cpts:
+//     // ret = cpsw_register_notifiers(cpsw);
+//     // if (ret)
+//     //     goto clean_unregister_netdev;
 
-    ret = cpsw_init_common(cpsw, cpsw->regs, ale_ageout,
-                           (u32 __force)ss_res->start + CPSW2_BD_OFFSET,
-                           descs_pool_size);
-    if (ret)
-        goto clean_dt_ret;
+//     // ret = cpsw_register_devlink(cpsw);
+//     // if (ret)
+//     //     goto clean_unregister_notifiers;
 
-    cpsw->wr_regs = (void*)cpsw->regs + CPSW2_WR_OFFSET;
+//     dev_notice(
+//         dev, "initialized (regs %pa, pool size %d) hw_ver:%08X %d.%d (%d)\n",
+//         &ss_res->start, descs_pool_size, cpsw->version,
+//         CPSW_MAJOR_VERSION(cpsw->version), CPSW_MINOR_VERSION(cpsw->version),
+//         CPSW_RTL_VERSION(cpsw->version));
 
-    cpsw->quirk_irq = false;
-    cpsw->txv[0].ch = cpdma_chan_create(cpsw->dma, 7, cpsw_tx_handler, 0);
-    if (IS_ERR(cpsw->txv[0].ch)) {
-        dev_err(dev, "error initializing tx dma channel\n");
-        ret = PTR_ERR(cpsw->txv[0].ch);
-        goto clean_cpts;
-    }
+//     pm_runtime_put(dev);
 
-    cpsw->rxv[0].ch = cpdma_chan_create(cpsw->dma, 0, cpsw_rx_handler, 1);
-    if (IS_ERR(cpsw->rxv[0].ch)) {
-        dev_err(dev, "error initializing rx dma channel\n");
-        ret = PTR_ERR(cpsw->rxv[0].ch);
-        goto clean_cpts;
-    }
-    cpsw_split_res(cpsw);
+//     return 0;
 
-    /* setup netdevs */
-    ret = cpsw_create_ports(cpsw);
-    if (ret)
-        goto clean_unregister_netdev;
-
-    /* Grab RX and TX IRQs. Note that we also have RX_THRESHOLD and
-     * MISC IRQs which are always kept disabled with this driver so
-     * we will not request them.
-     *
-     * If anyone wants to implement support for those, make sure to
-     * first request and append them to irqs_table array.
-     */
-
-    ret = devm_request_irq(dev, cpsw->irqs_table[0], cpsw_rx_interrupt, 0,
-                           dev_name(dev), cpsw);
-    if (ret < 0) {
-        dev_err(dev, "error attaching irq (%d)\n", ret);
-        goto clean_unregister_netdev;
-    }
-
-    ret = devm_request_irq(dev, cpsw->irqs_table[1], cpsw_tx_interrupt, 0,
-                           dev_name(dev), cpsw);
-    if (ret < 0) {
-        dev_err(dev, "error attaching irq (%d)\n", ret);
-        goto clean_unregister_netdev;
-    }
-
-    if (!cpsw->cpts)
-        goto skip_cpts;
-
-    ret = devm_request_irq(dev, cpsw->misc_irq, cpsw_misc_interrupt, 0,
-                           dev_name(cpsw->dev), cpsw);
-    if (ret < 0) {
-        dev_err(dev, "error attaching misc irq (%d)\n", ret);
-        goto clean_unregister_netdev;
-    }
-
-    /* Enable misc CPTS evnt_pend IRQ */
-    cpts_set_irqpoll(cpsw->cpts, false);
-
-skip_cpts:
-    // ret = cpsw_register_notifiers(cpsw);
-    // if (ret)
-    //     goto clean_unregister_netdev;
-
-    // ret = cpsw_register_devlink(cpsw);
-    // if (ret)
-    //     goto clean_unregister_notifiers;
-
-    ret = cpsw_register_ports(cpsw);
-    if (ret)
-        goto clean_unregister_netdev;
-
-    dev_notice(
-        dev, "initialized (regs %pa, pool size %d) hw_ver:%08X %d.%d (%d)\n",
-        &ss_res->start, descs_pool_size, cpsw->version,
-        CPSW_MAJOR_VERSION(cpsw->version), CPSW_MINOR_VERSION(cpsw->version),
-        CPSW_RTL_VERSION(cpsw->version));
-
-    pm_runtime_put(dev);
-
-    return 0;
-
-clean_unregister_netdev:
-    cpsw_unregister_ports(cpsw);
-clean_cpts:
-    cpts_release(cpsw->cpts);
-    cpdma_ctlr_destroy(cpsw->dma);
-clean_dt_ret:
-    cpsw_remove_dt(cpsw);
-    pm_runtime_put_sync(dev);
-    pm_runtime_disable(dev);
-    return ret;
-}
+// // clean_unregister_netdev:
+//     cpsw_unregister_ports(cpsw);
+// // clean_cpts:
+//     cpts_release(cpsw->cpts);
+//     cpdma_ctlr_destroy(cpsw->dma);
+// // clean_dt_ret:
+//     cpsw_remove_dt(cpsw);
+//     pm_runtime_put_sync(dev);
+//     pm_runtime_disable(dev);
+//     return ret;
+// }
 
 int cpsw_remove(struct cpsw_common* cpsw) {
     int ret;

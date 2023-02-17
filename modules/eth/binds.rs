@@ -1,11 +1,3 @@
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
-#![allow(non_upper_case_globals)]
-#![allow(improper_ctypes)]
-#![allow(missing_docs)]
-#![allow(unused)]
-
-use kernel::bindings::*;
 // Generated
 pub(crate) const CPDMA_MAX_CHANNELS: u32 = 32;
 pub(crate) const CPDMA_EOI_RX_THRESH: u32 = 0;
@@ -2847,7 +2839,7 @@ extern "C" {
 }
 extern "C" {
     pub(crate) fn cpsw_set_coalesce(
-        ndev: *mut net_device,
+        ndev: *mut cpsw_priv,
         coal: *mut ethtool_coalesce,
         kernel_coal: *mut kernel_ethtool_coalesce,
         extack: *mut netlink_ext_ack,
@@ -3585,6 +3577,15 @@ pub(crate) const CPSW_CPDMA: core::ffi::c_int = 1;
 //========================================================
 //====================custom==============================
 extern "C" {
-    pub(crate) fn cpsw_probe(cpsw: *mut cpsw_common, ss_res: *mut kernel::bindings::resource )->core::ffi::c_int;
-    pub(crate) fn cpsw_remove(cpsw: *const cpsw_common)->core::ffi::c_int;
+    // pub(crate) fn cpsw_probe(cpsw: *mut cpsw_common, ss_res: *mut kernel::bindings::resource )->core::ffi::c_int;
+    pub(crate) fn cpsw_remove(cpsw: *mut cpsw_common)->core::ffi::c_int;
+    pub(crate) fn cpsw_probe_dt(cpsw: *mut cpsw_common)->core::ffi::c_int;
+    pub(crate) fn cpsw_create_ports(cpsw: *mut cpsw_common)->core::ffi::c_int;
+    pub(crate) fn cpsw_rx_handler(token: *mut core::ffi::c_void, len: core::ffi::c_int, status: core::ffi::c_int);
+    pub(crate) fn  cpsw_register_ports(cpsw: *mut cpsw_common)->core::ffi::c_int;
+    // pub(crate) fn cpsw_create_ports(cpsw: *mut cpsw_common, ndev: *mut net_device, priv_data: *mut cpsw_priv, napi_dev: bool, i: core::ffi::c_int)->core::ffi::c_int;
+    // pub(crate) fn cpsw_ndo_open(priv_data: *mut cpsw_priv);
+    // pub(crate) fn cpsw_ndo_stop(priv_data: *mut cpsw_priv);
+    // pub(crate) fn cpsw_ndo_start_xmit(skb: *mut sk_buff, ndev: *mut net_device)-> netdev_tx_t;
+    // pub(crate) fn cpsw_ndo_start_xmit(skb: *mut sk_buff, ndev: *mut cpsw_priv, txq: *mut netdev_queue)-> netdev_tx_t;
 }

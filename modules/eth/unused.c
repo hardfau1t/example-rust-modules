@@ -123,3 +123,33 @@ static const struct ethtool_ops _cpsw_ethtool_ops = {
     .set_ringparam = cpsw_set_ringparam,
 };
 
+static int cpsw_ndo_set_mac_address(struct net_device* ndev, void* p) {
+    struct sockaddr* addr = (struct sockaddr*)p;
+    struct cpsw_priv* priv = netdev_priv(ndev);
+    struct cpsw_common* cpsw = priv->cpsw;
+    int ret, slave_no;
+    int flags = 0;
+    u16 vid = 0;
+
+    slave_no = cpsw_slave_index(cpsw, priv);
+    if (!is_valid_ether_addr(addr->sa_data))
+        return -EADDRNOTAVAIL;
+
+    ret = pm_runtime_resume_and_get(cpsw->dev);
+    if (ret < 0)
+        return ret;
+
+    vid = cpsw->slaves[slave_no].port_vlan;
+    flags = ALE_VLAN | ALE_SECURE;
+
+    cpsw_ale_del_ucast(cpsw->ale, priv->mac_addr, HOST_PORT_NUM, flags, vid);
+    cpsw_ale_add_ucast(cpsw->ale, addr->sa_data, HOST_PORT_NUM, flags, vid);
+
+    ether_addr_copy(priv->mac_addr, addr->sa_data);
+    eth_hw_addr_set(ndev, priv->mac_addr);
+    cpsw_set_slave_mac(&cpsw->slaves[slave_no], priv);
+
+    pm_runtime_put(cpsw->dev);
+
+    return 0;
+}

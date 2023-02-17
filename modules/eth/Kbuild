@@ -1,3 +1,3 @@
 ccflags-y := -Wall
 obj-m := eth.o
-eth-y := reth.o binds.o support.o
+eth-y := reth.o support.o net.o sys.o

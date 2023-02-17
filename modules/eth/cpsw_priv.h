@@ -390,7 +390,7 @@ struct cpsw_priv {
 #define ndev_to_cpsw(ndev) (((struct cpsw_priv*)netdev_priv(ndev))->cpsw)
 #define napi_to_cpsw(napi) container_of(napi, struct cpsw_common, napi)
 
-extern int (*cpsw_slave_index)(struct cpsw_common* cpsw,
+extern int cpsw_slave_index(struct cpsw_common* cpsw,
                                struct cpsw_priv* priv);
 
 struct addr_sync_ctx {
@@ -477,7 +477,7 @@ int cpsw_get_coalesce(struct net_device* ndev,
                       struct ethtool_coalesce* coal,
                       struct kernel_ethtool_coalesce* kernel_coal,
                       struct netlink_ext_ack* extack);
-int cpsw_set_coalesce(struct net_device* ndev,
+int cpsw_set_coalesce(struct cpsw_priv *ndev,
                       struct ethtool_coalesce* coal,
                       struct kernel_ethtool_coalesce* kernel_coal,
                       struct netlink_ext_ack* extack);

@@ -10,3 +10,4 @@ rust-project.json
 /snull/
 compile_commands.json
 .cache/
+html/
