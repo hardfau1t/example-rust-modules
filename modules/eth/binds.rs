@@ -2606,7 +2606,6 @@ pub(crate) struct cpsw_common {
     pub(crate) txv: [cpsw_vector; 8usize],
     pub(crate) rxv: [cpsw_vector; 8usize],
     pub(crate) ale: *mut cpsw_ale,
-    pub(crate) quirk_irq: bool_,
     pub(crate) rx_irq_disabled: bool_,
     pub(crate) tx_irq_disabled: bool_,
     pub(crate) irqs_table: [u32_; 2usize],

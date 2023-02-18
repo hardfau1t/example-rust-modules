@@ -1,5 +1,7 @@
 //! cpsw driver for beaglebone black
 #![allow(non_upper_case_globals)]
+mod sys;
+mod net;
 use core::{
     marker::{Send, Sync},
     ops::{Deref, DerefMut},
@@ -11,8 +13,7 @@ use kernel::{
     of, platform, prelude::*,
 };
 
-mod net;
-mod sys;
+
 
 module_platform_driver! {
     type: CpswDriver,
@@ -146,7 +147,7 @@ impl platform::Driver for CpswDriver {
         // clock frequency
         let clk = dev.clk_get(Some(c_str!("fck")))?;
         cpsw.bus_freq_mhz = (clk.get_rate() / 1_000_000).try_into().unwrap();
-        let mut ss_res_ptr: *mut kernel::bindings::resource = core::ptr::null_mut();
+        let mut ss_res_ptr: *mut kbinds::resource = core::ptr::null_mut();
         // get the registers
         cpsw.regs = pdev.devm_platform_get_and_ioremap_resource(0, &mut ss_res_ptr)?
             as *mut sys::cpsw_ss_regs;
@@ -220,7 +221,7 @@ impl platform::Driver for CpswDriver {
 
     fn remove(cpsw: &Self::Data) -> Result {
         pr_info!("platform driver removal requested\n");
-        unsafe { sys::cpsw_remove(cpsw.deref().deref() as *const _ as *mut _) };
+        cpsw.remove();
         core::result::Result::Ok(())
     }
 
