@@ -55,6 +55,9 @@
 #include "davinci_cpdma.h"
 
 #define CPTS_N_ETX_TS 4
+#define CTRL_MAC_LO_REG(offset, id) ((offset) + 0x8 * (id))
+#define CTRL_MAC_HI_REG(offset, id) ((offset) + 0x8 * (id) + 0x4)
+
 
 static void cpsw_init_host_port_dual_mac(struct cpsw_common* cpsw) {
     int vlan = cpsw->data.default_vlan;
@@ -196,42 +199,6 @@ static void cpsw_adjust_link(struct net_device* ndev) {
         cpsw_split_res(cpsw);
 }
 
-static int cpsw_add_vlan_ale_entry(struct cpsw_priv* priv, unsigned short vid) {
-    struct cpsw_common* cpsw = priv->cpsw;
-    int unreg_mcast_mask = 0;
-    int mcast_mask;
-    u32 port_mask;
-    int ret;
-
-    port_mask = (1 << priv->emac_port) | ALE_PORT_HOST;
-
-    mcast_mask = ALE_PORT_HOST;
-    if (priv->ndev->flags & IFF_ALLMULTI)
-        unreg_mcast_mask = mcast_mask;
-
-    ret = cpsw_ale_add_vlan(cpsw->ale, vid, port_mask, 0, port_mask,
-                            unreg_mcast_mask);
-    if (ret != 0)
-        return ret;
-
-    ret = cpsw_ale_add_ucast(cpsw->ale, priv->mac_addr, HOST_PORT_NUM, ALE_VLAN,
-                             vid);
-    if (ret != 0)
-        goto clean_vid;
-
-    ret = cpsw_ale_add_mcast(cpsw->ale, priv->ndev->broadcast, mcast_mask,
-                             ALE_VLAN, vid, 0);
-    if (ret != 0)
-        goto clean_vlan_ucast;
-    return 0;
-
-clean_vlan_ucast:
-    cpsw_ale_del_ucast(cpsw->ale, priv->mac_addr, HOST_PORT_NUM, ALE_VLAN, vid);
-clean_vid:
-    cpsw_ale_del_vlan(cpsw->ale, vid, 0);
-    return ret;
-}
-
 static void cpsw_slave_open(struct cpsw_slave* slave, struct cpsw_priv* priv) {
     struct cpsw_common* cpsw = priv->cpsw;
     struct phy_device* phy;
@@ -295,54 +262,10 @@ static void cpsw_slave_open(struct cpsw_slave* slave, struct cpsw_priv* priv) {
                      slave->data->phy_if);
 }
 
-static int cpsw_ndo_vlan_rx_add_vid(struct net_device* ndev,
-                                    __be16 proto,
-                                    u16 vid) {
-    struct cpsw_priv* priv = netdev_priv(ndev);
-    struct cpsw_common* cpsw = priv->cpsw;
-    int ret, i;
-
-    if (vid == cpsw->data.default_vlan)
-        return 0;
-
-    ret = pm_runtime_resume_and_get(cpsw->dev);
-    if (ret < 0)
-        return ret;
-
-    /* In dual EMAC, reserved VLAN id should not be used for
-     * creating VLAN interfaces as this can break the dual
-     * EMAC port separation
-     */
-    for (i = 0; i < cpsw->data.slaves; i++) {
-        if (cpsw->slaves[i].ndev && vid == cpsw->slaves[i].port_vlan) {
-            ret = -EINVAL;
-            goto err;
-        }
-    }
-
-    dev_dbg(priv->dev, "Adding vlanid %d to vlan filter\n", vid);
-    ret = cpsw_add_vlan_ale_entry(priv, vid);
-err:
-    pm_runtime_put(cpsw->dev);
-    return ret;
-}
-
-static int cpsw_restore_vlans(struct net_device* vdev, int vid, void* arg) {
-    struct cpsw_priv* priv = arg;
-
-    if (!vdev || !vid)
-        return 0;
-
-    cpsw_ndo_vlan_rx_add_vid(priv->ndev, 0, vid);
-    return 0;
-}
-
 /* restore resources after port reset */
 static void cpsw_restore(struct cpsw_priv* priv) {
     struct cpsw_common* cpsw = priv->cpsw;
 
-    /* restore vlan configurations */
-    vlan_for_each(priv->ndev, cpsw_restore_vlans, priv);
 
     /* restore MQPRIO offload */
     cpsw_mqprio_resume(&cpsw->slaves[priv->emac_port - 1], priv);
@@ -608,8 +531,6 @@ static const struct net_device_ops cpsw_netdev_ops = {
     .ndo_stop = cpsw_ndo_stop,
     .ndo_start_xmit = cpsw_ndo_start_xmit,
     // .ndo_set_mac_address = cpsw_ndo_set_mac_address,
-    // .ndo_vlan_rx_kill_vid = cpsw_ndo_vlan_rx_kill_vid,
-    // .ndo_vlan_rx_add_vid = cpsw_ndo_vlan_rx_add_vid,
 };
 irqreturn_t cpsw_tx_interrupt(int irq, void* dev_id) {
     
@@ -739,8 +660,6 @@ int cpsw_create_ports(struct cpsw_common* cpsw) {
 
         cpsw->slaves[i].ndev = ndev;
 
-    // ndev->features |= NETIF_F_HW_VLAN_CTAG_FILTER | NETIF_F_HW_VLAN_CTAG_RX |
-    //                   NETIF_F_NETNS_LOCAL | NETIF_F_HW_TC;
 
         ndev->netdev_ops = &cpsw_netdev_ops;
         // ndev->ethtool_ops = &cpsw_ethtool_ops;
@@ -1790,4 +1709,31 @@ int cpsw_fill_rx_channels(struct cpsw_priv* priv) {
     }
 
     return 0;
+}
+int ti_cm_get_macid(struct device *dev, int slave, u8 *mac_addr)
+{
+    u16 offset = 0x630;
+	u32 macid_lo;
+	u32 macid_hi;
+	struct regmap *syscon;
+
+	syscon = syscon_regmap_lookup_by_phandle(dev->of_node, "syscon");
+	if (IS_ERR(syscon)) {
+		if (PTR_ERR(syscon) == -ENODEV)
+			return 0;
+		return PTR_ERR(syscon);
+	}
+
+	regmap_read(syscon, CTRL_MAC_LO_REG(offset, slave), &macid_lo);
+	regmap_read(syscon, CTRL_MAC_HI_REG(offset, slave), &macid_hi);
+
+	mac_addr[5] = (macid_lo >> 8) & 0xff;
+	mac_addr[4] = macid_lo & 0xff;
+	mac_addr[3] = (macid_hi >> 24) & 0xff;
+	mac_addr[2] = (macid_hi >> 16) & 0xff;
+	mac_addr[1] = (macid_hi >> 8) & 0xff;
+	mac_addr[0] = macid_hi & 0xff;
+
+	return 0;
+
 }
