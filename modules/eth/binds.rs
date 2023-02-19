@@ -2495,7 +2495,7 @@ pub(crate) struct cpsw_wr_regs {
     pub(crate) tx_imax: u32_,
 }
 #[repr(C)]
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Copy, Clone, Debug)]
 pub(crate) struct cpsw_ss_regs {
     pub(crate) id_ver: u32_,
     pub(crate) control: u32_,

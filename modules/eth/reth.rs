@@ -125,6 +125,13 @@ impl DerefMut for CpswAdapter {
     NetdevTX::TX_OK
 } */
 
+/// gets called upon transmit complete, schedules napi interrupt
+/* unsafe fn cpsw_tx_interrupt(irq: i32, dev_id: *mut core::ffi::c_void)->kbinds::irqreturn_t{
+    let cpsw = (dev_id as *mut sys::cpsw_common).as_mut();
+    return kbinds::irqreturn_IRQ_HANDLED;
+} */
+
+
 struct CpswDriver;
 impl platform::Driver for CpswDriver {
     kernel::define_of_id_table! {(), [
@@ -153,6 +160,7 @@ impl platform::Driver for CpswDriver {
             as *mut sys::cpsw_ss_regs;
         // SAFETY: ss_res_ptr is initialized in pdev.devm_platform_get_and_ioremap_resource
         let ss_res = unsafe { ss_res_ptr.as_mut() }.unwrap();
+        pr_info!("regs : {:?}, ss_res: {:p}, start: {:x}, end: {}, name: {:?}, desc: {}\n", cpsw.regs.as_mut().unwrap(), ss_res_ptr, ss_res.start, ss_res.end, ss_res.name, ss_res.desc);
 
         // get irqs
         cpsw.irqs_table[0] = pdev.platform_get_irq_byname(c_str!("rx"))? as u32;

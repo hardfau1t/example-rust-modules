@@ -1885,6 +1885,7 @@ static int cpsw_probe(struct platform_device *pdev)
 		return ret;
 	}
 	cpsw->regs = ss_regs;
+    pr_info("ss_regs: %p, control: %p, %u\n", ss_regs, &cpsw->regs->control, cpsw->regs->control);
 
 	irq = platform_get_irq_byname(pdev, "rx");
 	if (irq < 0)
