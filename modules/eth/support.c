@@ -559,25 +559,25 @@ irqreturn_t cpsw_rx_interrupt(int irq, void* dev_id) {
 }
 
 void cpsw_tx_handler(void* token, int len, int status) {
-    struct cpsw_meta_xdp* xmeta;
-    struct xdp_frame* xdpf;
+    // struct cpsw_meta_xdp* xmeta;
+    // struct xdp_frame* xdpf;
     struct net_device* ndev;
     struct netdev_queue* txq;
     struct sk_buff* skb;
     int ch;
-    if (cpsw_is_xdpf_handle(token)) {
-        xdpf = cpsw_handle_to_xdpf(token);
-        xmeta = (void*)xdpf + CPSW_XMETA_OFFSET;
-        ndev = xmeta->ndev;
-        ch = xmeta->ch;
-        xdp_return_frame(xdpf);
-    } else {
+    // if (cpsw_is_xdpf_handle(token)) {
+    //     xdpf = cpsw_handle_to_xdpf(token);
+    //     xmeta = (void*)xdpf + CPSW_XMETA_OFFSET;
+    //     ndev = xmeta->ndev;
+    //     ch = xmeta->ch;
+    //     xdp_return_frame(xdpf);
+    // } else {
         skb = token;
         ndev = skb->dev;
         ch = skb_get_queue_mapping(skb);
         cpts_tx_timestamp(ndev_to_cpsw(ndev)->cpts, skb);
         dev_kfree_skb_any(skb);
-    }
+    // }
 
     /* Check whether the queue is stopped due to stalled tx dma, if the
      * queue is stopped then start the queue as we have free desc for tx

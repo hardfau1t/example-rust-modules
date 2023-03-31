@@ -2,8 +2,9 @@
 
 use kernel::bindings as kbinds;
 
-pub(crate) struct NetDev{
-    ptr: kbinds::net_device,
+#[repr(transparent)]
+pub(crate) struct Device{
+    inner: kbinds::net_device,
 }
 
 impl NetDev{
