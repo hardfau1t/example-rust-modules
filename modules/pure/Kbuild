@@ -1,1 +1,2 @@
 obj-m := pure.o
+#pure-y := pure.o net.o
